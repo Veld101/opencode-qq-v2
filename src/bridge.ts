@@ -65,18 +65,19 @@ export class V2Bridge implements HostBridge {
     return null
   }
 
-  async sessionCreate(title: string): Promise<{ id: string }> {
+  async sessionCreate(title: string, directory?: string): Promise<{ id: string }> {
     const model = await this.resolveModel()
     if (!model) {
       throw new Error(
         '未配置模型：请在 opencode-qq.json 设置 "model": "providerID/modelID"，或为 OpenCode 设置全局默认模型',
       )
     }
+    const dir = directory ?? this.workdir
     const session = await this.ctx.session.create({
       title,
       model,
       // 固定工作目录（Location.PublicRef = { directory }）
-      ...(this.workdir ? { location: { directory: this.workdir } } : {}),
+      ...(dir ? { location: { directory: dir } } : {}),
     })
     return { id: String(session.id) }
   }

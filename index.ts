@@ -12,6 +12,7 @@ import { StreamSender } from "./src/qq/stream"
 import { EventPusher } from "./src/event-pusher"
 import { AssistantTextBuffer } from "./src/text-buffer"
 import { SessionManager } from "./src/session-manager"
+import { resolveWorkspaces } from "./src/workspaces"
 import { V2Bridge } from "./src/bridge"
 import { splitText } from "./src/util/chunk"
 import { guessImageMime, toImageDataUrl } from "./src/util/media"
@@ -68,17 +69,15 @@ export default {
     const bridge = new V2Bridge(ctx)
     const sessions = new SessionManager(bridge, SESSIONS_PATH(), fs, (sid) => approver.countBySession(sid))
     bridge.onSessionReset = (sid) => approver.clearSession(sid)
+    if (cfg) sessions.setWorkspaces(resolveWorkspaces(cfg))
 
     // ── 事件订阅 ────────────────────────────────────────────────────────────
     const listeners: Array<(e: InboundEvent) => void> = []
     const assistantBuf = new AssistantTextBuffer((sid) => sessions.isOurSession(sid))
 
-    const openidOfSession = (sessionId: string): string | null => {
-      for (const [openid, sid] of Object.entries(sessions.snapshot())) if (sid === sessionId) return openid
-      return null
-    }
+    const openidOfSession = (sessionId: string): string | null => sessions.openidOfSession(sessionId)
 
-    const sessionIdOf = (openid: string): string | null => sessions.snapshot()[openid] ?? null
+    const sessionIdOf = (openid: string): string | null => sessions.getSessionId(openid)
 
     /** 延迟埋点：openid → 本回合时间线，用于定位「到底慢在哪」 */
     const timings = new Map<string, { t0: number; firstTextAt: number | null; tools: number }>()
@@ -361,8 +360,8 @@ export default {
     // 流式打字机：按节流把累计全文推给 QQ（每片是全量快照）
     const flushTimer = setInterval(() => {
       if (!cfg?.streaming || !auth) return
-      for (const [openid, sid] of Object.entries(sessions.snapshot())) {
-        const bufText = assistantBuf.text(sid)
+      for (const { openid, sessionId } of sessions.listSessions()) {
+        const bufText = assistantBuf.text(sessionId)
         if (!bufText) continue
         const s = streams.get(openid)
         if (!s || s.sender?.failed) continue
@@ -424,7 +423,6 @@ export default {
 
     // ── 配置热更新 ──────────────────────────────────────────────────────────
     const applyConfig = (next: QqConfig | null): void => {
-      const prev = cfg
       cfg = next
 
       if (!next) {
@@ -441,16 +439,17 @@ export default {
       allowSet = new Set(next.allowlist)
       bridge.configure({ model: next.model, workdir: next.workdir })
 
-      // 工作目录变更后旧会话的位置无法迁移，只能重置绑定（下次消息在新目录重开）
-      if (prev && prev.workdir !== next.workdir) {
-        sessions.resetAll()
-        log("WARN", `工作目录变更 → ${next.workdir ?? "(跟随插件 location)"}，已重置全部 QQ 会话`)
+      // 工作区列表变化时，旧会话的位置无法迁移，只能重置绑定（SessionManager 内部按指纹判断）
+      const workspaces = resolveWorkspaces(next)
+      if (sessions.setWorkspaces(workspaces)) {
+        log("WARN", "工作区列表已变化，已重置全部 QQ 会话绑定")
       }
 
+      const wsDesc = workspaces.map((w) => `${w.name}${w.isDefault ? "*" : ""}=${w.path ?? "(跟随 location)"}`).join(", ")
       log(
         "INFO",
-        `配置已应用 env=${next.sandbox ? "sandbox" : "prod"} ` +
-          `workdir=${next.workdir ?? "(跟随插件 location)"} model=${next.model ?? "(全局默认)"} ` +
+        `配置已应用 env=${next.sandbox ? "sandbox" : "prod"} 工作区=[${wsDesc}] ` +
+          `model=${next.model ?? "(全局默认)"} ` +
           `allowlist=${next.allowlist.length === 0 ? "(不限制)" : next.allowlist.join(",")} ` +
           `streaming=${next.streaming} toolProgress=${next.events.toolProgress} log=${LOG_PATH()}`,
       )

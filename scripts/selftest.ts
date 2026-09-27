@@ -11,6 +11,7 @@ import { V2Bridge } from "../src/bridge"
 import { InstanceLock } from "../src/lock"
 import { parseC2CMessage } from "../src/qq/gateway"
 import { QQApi, __resetSeqCounters } from "../src/qq/api"
+import { defaultWorkspaceName, findWorkspace, resolveWorkspaces } from "../src/workspaces"
 import { splitText } from "../src/util/chunk"
 import { Throttler } from "../src/util/throttle"
 import { parseCommand } from "../src/commands"
@@ -206,12 +207,14 @@ section("V2Bridge：V2 宿主接口换形")
   eq("noReply 不触发模型", calls.includes("prompt"), false)
 }
 
-section("SessionManager：指令与派发")
+section("SessionManager：指令、派发与工作区隔离")
 {
   const sent: any[] = []
+  const created: Array<{ title: string; dir?: string }> = []
   const fake: HostBridge = {
-    async sessionCreate(title: string) {
-      return { id: "ses_x" }
+    async sessionCreate(title: string, dir?: string) {
+      created.push({ title, dir })
+      return { id: `ses_${created.length}` }
     },
     async sessionPrompt(_id, text, noReply) {
       sent.push({ text, noReply })
@@ -220,11 +223,14 @@ section("SessionManager：指令与派发")
   }
   const tmp = `D:/Data/Temp/opencode/selftest-sessions-${Date.now()}.json`
   const sm = new SessionManager(fake, tmp, undefined as any, () => 0)
+  sm.setWorkspaces(resolveWorkspaces({ workspaces: [], workdir: "D:/proj/a" } as any))
 
   eq("指令 /help", (await sm.dispatch("user1", "/help")).includes("opencode-qq 指令"), true)
   eq("普通消息得到回复", await sm.dispatch("user1", "你好"), "回复:你好")
   truthy("会话已建立", (await sm.getSessionId("user1")) !== null)
   truthy("首次会话带人设引导", sent[0]?.noReply === true)
+  eq("默认工作区名为 default", sm.workspaceOf("user1"), "default")
+  eq("建会话时带上工作区目录", created[0]?.dir, "D:/proj/a")
   eq("指令 /new 重置", (await sm.dispatch("user1", "/new")).includes("已重置"), true)
   eq("重置后无会话", await sm.getSessionId("user1"), null)
   eq("未知斜杠指令透传给模型", await sm.dispatch("user1", "/init"), "回复:/init")
@@ -235,6 +241,108 @@ section("SessionManager：指令与派发")
   sm.resetAll()
   eq("resetAll 清空 user1", await sm.getSessionId("user1"), null)
   eq("resetAll 清空 user2", await sm.getSessionId("user2"), null)
+}
+
+section("工作区：列表解析与切换隔离")
+{
+  const single = resolveWorkspaces({ workspaces: [], workdir: "D:/only" } as any)
+  eq("未配置 workspaces 时退化为单一工作区", single.length, 1)
+  eq("退化为 default 且标记默认", single[0], { name: "default", path: "D:/only", isDefault: true })
+
+  const list = resolveWorkspaces({
+    workspaces: [
+      { name: "opencode", path: "D:/workspace/opencode" },
+      { name: "img", path: "D:/workspace/img-operation" },
+      { name: "opencode", path: "D:/dup" },
+      { name: "  ", path: "x" },
+    ],
+    workdir: "D:/ignored",
+    defaultWorkspace: "img",
+  } as any)
+  eq("去重并过滤空名", list.map((w) => w.name), ["opencode", "img"])
+  eq("defaultWorkspace 生效", defaultWorkspaceName(list), "img")
+  eq("按名字查找（大小写不敏感）", findWorkspace(list, "OPENCODE")?.path, "D:/workspace/opencode")
+  eq("按序号查找（1 基）", findWorkspace(list, "2")?.name, "img")
+  eq("越界序号返回 null", findWorkspace(list, "9"), null)
+  eq("未知名字返回 null", findWorkspace(list, "nope"), null)
+  eq(
+    "defaultWorkspace 指向不存在时回退首项",
+    defaultWorkspaceName(resolveWorkspaces({ workspaces: [{ name: "a" }], defaultWorkspace: "zzz" } as any)),
+    "a",
+  )
+
+  const created2: Array<{ dir?: string }> = []
+  const fake: HostBridge = {
+    async sessionCreate(_t: string, dir?: string) {
+      created2.push({ dir })
+      return { id: `ses_ws_${created2.length}` }
+    },
+    async sessionPrompt(_id, text, noReply) {
+      return { text: noReply ? "" : `回复:${text}` }
+    },
+  }
+  const tmp = `D:/Data/Temp/opencode/selftest-ws-${Date.now()}.json`
+  const sm = new SessionManager(fake, tmp, undefined as any, () => 0)
+  sm.setWorkspaces(
+    resolveWorkspaces({
+      workspaces: [
+        { name: "opencode", path: "D:/workspace/opencode" },
+        { name: "img", path: "D:/workspace/img-operation" },
+      ],
+      defaultWorkspace: "opencode",
+    } as any),
+  )
+
+  eq("初始为默认工作区", sm.workspaceOf("u"), "opencode")
+  await sm.dispatch("u", "在 opencode 里问")
+  const opencodeSession = sm.getSessionId("u")
+  truthy("opencode 工作区已建会话", opencodeSession !== null)
+  eq("会话建在 opencode 目录", created2[0]?.dir, "D:/workspace/opencode")
+
+  truthy("切换提示含目标工作区", (await sm.dispatch("u", "/workspace img")).includes("img"))
+  eq("切换后当前工作区为 img", sm.workspaceOf("u"), "img")
+  eq("img 工作区尚无会话（历史隔离）", sm.getSessionId("u"), null)
+
+  await sm.dispatch("u", "在 img 里问")
+  const imgSession = sm.getSessionId("u")
+  truthy("img 工作区新开会话", imgSession !== null)
+  truthy("两个工作区会话不同", imgSession !== opencodeSession)
+  eq("会话建在 img 目录", created2[1]?.dir, "D:/workspace/img-operation")
+  eq("两个工作区各建一次会话", created2.length, 2)
+
+  eq("/workspace 无参可列出", (await sm.dispatch("u", "/workspace")).includes("img"), true)
+  truthy("序号切换也可用", (await sm.dispatch("u", "/ws 1")).includes("opencode"))
+  eq("切回后沿用原会话", sm.getSessionId("u"), opencodeSession)
+  eq("切回不重复建会话", created2.length, 2)
+
+  truthy("未知工作区给出可用列表", (await sm.dispatch("u", "/workspace nope")).includes("opencode"))
+
+  await sm.dispatch("u", "/new")
+  eq("/new 只重置当前工作区", sm.getSessionId("u"), null)
+  await sm.dispatch("u", "/workspace img")
+  eq("其他工作区会话不受影响", sm.getSessionId("u"), imgSession)
+
+  sm.setWorkspaces(resolveWorkspaces({ workspaces: [{ name: "opencode", path: "D:/moved" }] } as any))
+  eq("工作区列表变化后会话全部失效", sm.getSessionId("u"), null)
+}
+
+section("SessionManager：v1 存储格式迁移")
+{
+  const dir = `D:/Data/Temp/opencode/migrate-${Date.now()}`
+  fs.mkdirSync(dir, { recursive: true })
+  const p = path.join(dir, "sessions.json")
+  fs.writeFileSync(p, JSON.stringify({ "user-old": "ses_legacy" }))
+  const fake: HostBridge = {
+    async sessionCreate() {
+      return { id: "x" }
+    },
+    async sessionPrompt() {
+      return { text: "" }
+    },
+  }
+  const sm = new SessionManager(fake, p, undefined as any, () => 0)
+  sm.setWorkspaces(resolveWorkspaces({ workspaces: [{ name: "solo", path: "D:/solo" }] } as any))
+  eq("v1 记录挂到默认工作区", sm.getSessionId("user-old"), "ses_legacy")
 }
 
 // ── Throttler ───────────────────────────────────────────────────────────────

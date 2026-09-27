@@ -17,7 +17,7 @@ QQ 官方 WebSocket 网关 (wss://api.bot.qq.com/websocket/，本机主动外连
     ▼
 QQGateway（Token 预刷新 · 心跳 · Resume 补发 · 指数退避重连）
     │
-    ├── 指令层：/new  /status  /help
+    ├── 指令层：/new  /workspace  /status  /help
     ├── 审批层：Approver（编号 → “同意 N / 拒绝 N / 总是 N”）
     ▼
 V2Bridge ──► OpenCode V2 插件上下文 ctx
@@ -91,8 +91,11 @@ OpenCode 会热加载；`opencode plugin list` 应能看到 `opencode-qq  local 
 | `sandbox` | `false` | 沙箱环境走 `sandbox.api.sgroup.qq.com`；正式走 `api.bot.qq.com` |
 | `allowlist` | `[]` | 允许的 **openid** 白名单。**空数组 = 不限制，强烈建议填上** |
 | `model` | 无 | 覆盖模型，`providerID/modelID`；不填用 OpenCode 全局默认 |
+| `workspaces` | 无 | 工作区白名单 `[{ name, path }]`。QQ 侧**只能在这些条目之间切换**，不能指定任意路径 |
+| `defaultWorkspace` | 列表首项 | 默认工作区名；指向不存在的名字时回退首项 |
+| `workdir` | 无 | 旧的单一工作目录；**仅在未配置 `workspaces` 时**作为唯一工作区（向后兼容） |
 | `markdownReply` | `true` | 用 Markdown 发送，失败自动降级纯文本 |
-| `streaming` | `false` | 打字机流式输出（依赖 `session.text.delta`）。**建议先跑通再开** |
+| `streaming` | `true` | 打字机流式输出（依赖 `session.text.delta`），失败自动回落普通回复 |
 | `events.toolProgress` | `false` | 推送工具执行进度（按会话 60 秒至多一条） |
 
 环境变量（优先级高于文件）：`QQ_BOT_APPID`、`QQ_BOT_APPSECRET`、`QQ_BOT_MODEL`、`OPENCODE_QQ_CONFIG`（自定义文件路径）。
@@ -128,10 +131,48 @@ bunx tsc --noEmit           # 类型检查
 
 | 指令 | 行为 |
 | --- | --- |
-| `/new` | 重置当前会话 |
-| `/status` | 查看会话 ID、待审批数 |
+| `/new` | 重置**当前工作区**的会话 |
+| `/workspace`（简写 `/ws`） | 列出工作区，标出当前项与会话状态 |
+| `/workspace <名称\|序号>` | 切换工作区，历史相互独立 |
+| `/status` | 查看当前工作区、目录、会话 ID、待审批数 |
 | `/help` | 帮助 |
 | `同意 N` / `拒绝 N` / `总是 N` | 应答第 N 号权限请求 |
+
+## 多项目：工作区切换
+
+**一个 QQ 号 × 每个工作区 = 各自独立的长期会话**，历史互不污染；切换项目不会把上一个项目的上下文带过去。
+
+```json
+{
+  "workspaces": [
+    { "name": "opencode", "path": "D:/workspace/opencode" },
+    { "name": "img", "path": "D:/workspace/img-operation" }
+  ],
+  "defaultWorkspace": "opencode"
+}
+```
+
+QQ 里：
+
+```
+你: /workspace
+机器人: 当前工作区: opencode
+        → 1. opencode — D:/workspace/opencode [已有会话]
+          2. img — D:/workspace/img-operation [未开会话]
+        切换: /workspace <名称|序号>
+
+你: /ws 2
+机器人: 已切换到工作区「img」
+        目录: D:/workspace/img-operation
+        下次消息将在此工作区新建会话
+```
+
+设计取舍：
+
+- **只允许在配置声明的工作区之间切换**，不接受 QQ 里输入任意路径 —— 否则等于开放远程任意目录读写
+- `path` 省略时该工作区跟随 OpenCode 当前目录
+- 修改 `workspaces` / `defaultWorkspace` 会**重置全部会话绑定**（旧会话的位置无法迁移），日志会记 `工作区列表已变化`
+- 存储格式为 v2（`{ version, current, sessions }`，键为 `openid::工作区`）；旧的 v1 文件（`openid → sessionId`）会自动迁移到默认工作区
 
 ## 安全须知
 
@@ -210,7 +251,7 @@ opencode api get /api/model
 - **机器人不能主动开聊**，必须先由用户发消息。被动回复窗口 60 分钟，每条消息最多回 4 条；超窗转为主动消息，受平台频控与额度约束。
 - 新机器人**正式环境默认启用 IP 白名单**，提审上线前需在管理端填本机公网出口 IP；沙箱不受影响。
 - `session.text.delta` 是 ephemeral 事件，断线期间会丢片（`session.text.ended` 会补全量）。
-- 会话建在 OpenCode 当前工作目录下 —— 也就是 QQ 发来的指令会作用于 OpenCode 所在的项目。
+- 会话建在**当前工作区**的目录下。未配置 `workspaces` 时等价于 `workdir`；两者都没有时跟随 OpenCode 当前目录。
 
 ## 目录结构
 
@@ -218,7 +259,8 @@ opencode api get /api/model
 index.ts                 插件入口（export default { id, setup }）
 src/
   bridge.ts              V2 宿主绑定层（prompt/wait/context/synthetic/permission）
-  session-manager.ts     每个 openid ↔ 长期会话，落盘延续
+  session-manager.ts     每个 (openid, 工作区) ↔ 独立长期会话，落盘延续（v2 格式，含 v1 迁移）
+  workspaces.ts          工作区列表解析、按名/序号查找、变更指纹
   text-buffer.ts         累计 session.text.* 流式文本
   event-pusher.ts        完成 / 出错 / 工具进度推送
   approver.ts            权限请求编号与应答解析

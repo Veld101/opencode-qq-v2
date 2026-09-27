@@ -36,6 +36,18 @@ export function loadConfig(path: string = CONFIG_PATH()): QqConfig | null {
     events: { toolProgress: file.events?.toolProgress ?? false },
     model: typeof modelRaw === "string" && modelRaw.length > 0 ? modelRaw : undefined,
     workdir: typeof workdirRaw === "string" && workdirRaw.length > 0 ? workdirRaw : undefined,
+    workspaces: Array.isArray(file.workspaces)
+      ? file.workspaces
+          .filter((w: any) => w && typeof w === "object" && typeof w.name === "string")
+          .map((w: any) => ({
+            name: String(w.name),
+            path: typeof w.path === "string" && w.path.length > 0 ? w.path : undefined,
+          }))
+      : [],
+    defaultWorkspace:
+      typeof file.defaultWorkspace === "string" && file.defaultWorkspace.length > 0
+        ? file.defaultWorkspace
+        : undefined,
     markdownReply: file.markdownReply ?? true,
     // 默认关闭流式：先用「等待完成 + 读取最终文本」的可靠路径跑通，验证后再开
     streaming: file.streaming ?? false,
