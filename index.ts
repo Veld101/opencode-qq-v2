@@ -81,7 +81,7 @@ export default {
     const sessionIdOf = (openid: string): string | null => sessions.snapshot()[openid] ?? null
 
     /** 延迟埋点：openid → 本回合时间线，用于定位「到底慢在哪」 */
-    const timings = new Map<string, { t0: number; firstTextAt: number | null }>()
+    const timings = new Map<string, { t0: number; firstTextAt: number | null; tools: number }>()
 
     const pusher = new EventPusher({
       isOurSession: (sid) => sessions.isOurSession(sid),
@@ -112,13 +112,21 @@ export default {
     listeners.push((e) => {
       assistantBuf.handle(e)
 
-      // 埋点：本回合首个文本片出现的时间（= 用户视角的「首字延迟」）
+      // 埋点：本回合首个文本片出现的时间（= 用户视角的「首字延迟」）与工具调用次数
       if (e.type === "session.text.delta" || e.type === "session.text.ended") {
         const sid = String(e.data?.sessionID ?? "")
         const openid = sid ? openidOfSession(sid) : null
         if (openid) {
           const t = timings.get(openid)
           if (t && t.firstTextAt === null) t.firstTextAt = Date.now()
+        }
+      }
+      if (e.type === "session.tool.called") {
+        const sid = String(e.data?.sessionID ?? "")
+        const openid = sid ? openidOfSession(sid) : null
+        if (openid) {
+          const t = timings.get(openid)
+          if (t) t.tools++
         }
       }
 
@@ -312,7 +320,7 @@ export default {
             (files.length ? `[图片 x${files.length}] ` : "") +
             msg.content
 
-          const timing = { t0: Date.now(), firstTextAt: null as number | null }
+          const timing = { t0: Date.now(), firstTextAt: null as number | null, tools: 0 }
           timings.set(msg.openid, timing)
           stream = beginStream(msg.openid)
           const stopHeartbeat = startHeartbeat(msg.openid, () => {
@@ -340,7 +348,7 @@ export default {
             delivered ? "INFO" : "ERROR",
             `${delivered ? "已回复" : "回复未送达"} openid=${msg.openid} 字数=${answer.length} ` +
               `流式=${deliveredByStream} 首字=${firstTextMs === null ? "无" : `${firstTextMs}ms`} ` +
-              `总耗时=${Date.now() - timing.t0}ms`,
+              `工具=${timing.tools} 总耗时=${Date.now() - timing.t0}ms`,
           )
         } catch (e) {
           if (stream && streams.get(msg.openid) === stream) streams.delete(msg.openid)
