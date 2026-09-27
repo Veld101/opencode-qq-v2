@@ -6,6 +6,7 @@ const OP_DISPATCH = 0
 const OP_HEARTBEAT = 1
 const OP_IDENTIFY = 2
 const OP_RESUME = 6
+const OP_INVALID_SESSION = 9
 const OP_HELLO = 10
 const OP_HEARTBEAT_ACK = 11
 
@@ -21,8 +22,21 @@ export type GatewayOpts = {
   message: (msg: QqIncoming) => void | Promise<void>
   /** 可选：原始事件调试钩子（用于协议字段漂移排查） */
   onEvent?: (type: string, data: Record<string, any>) => void
+  /** 可选：心跳假死检测触发（连接还在但服务端不再响应心跳） */
+  onStale?: (detail: string) => void
   maxSeen?: number
   reconnectBaseMs?: number
+}
+
+/**
+ * 心跳假死判定。
+ *
+ * 只发心跳不校验 ACK 是不够的：经代理（尤其 fake-ip/TUN）时，
+ * 经常出现 TCP 仍 Established、上游早已失效的情况——表现为「明明显示已连接，却收不到任何消息」。
+ * 连续 2 次未收到 ACK，或距上次 ACK 超过 3 个心跳周期，即判定假死并强制重连。
+ */
+export function isHeartbeatStale(pendingHeartbeats: number, sinceAckMs: number, intervalMs: number): boolean {
+  return pendingHeartbeats >= 2 || sinceAckMs > intervalMs * 3
 }
 
 /** 解析 QQ 官方单聊消息事件，兼容两种字段形状 */
@@ -60,6 +74,10 @@ export class QQGateway {
   private lastSeq: number | null = null
   private resumeAttempted = false
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
+  /** 最近一次收到心跳 ACK 的时间，用于假死检测 */
+  private lastAckAt = 0
+  /** 已发出但尚未收到 ACK 的心跳数 */
+  private pendingHeartbeats = 0
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private reconnectAttempt = 0
   private stopped = false
@@ -179,7 +197,17 @@ export class QQGateway {
         break
       }
       case OP_HEARTBEAT_ACK:
+        this.lastAckAt = Date.now()
+        this.pendingHeartbeats = 0
         break
+      case OP_INVALID_SESSION: {
+        // 服务端拒绝 Resume：清空会话后重新 Identify，否则会一直重连失败
+        this.sessionId = null
+        this.lastSeq = null
+        this.resumeAttempted = false
+        void this.sendIdentify().catch(() => this.ws?.close())
+        break
+      }
       case OP_DISPATCH: {
         this.lastSeq = typeof pkt.s === "number" ? pkt.s : this.lastSeq
         const d = (pkt.d ?? {}) as Record<string, any>
@@ -215,7 +243,25 @@ export class QQGateway {
 
   private startHeartbeat(intervalMs: number): void {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
+    this.lastAckAt = Date.now()
+    this.pendingHeartbeats = 0
     this.heartbeatTimer = setInterval(() => {
+      const sinceAck = Date.now() - this.lastAckAt
+      if (isHeartbeatStale(this.pendingHeartbeats, sinceAck, intervalMs)) {
+        // 假死：主动拆连接并重连（不能只调 close()，僵尸连接可能永远等不到 close 事件）
+        this.opts.onStale?.(
+          `连续 ${this.pendingHeartbeats} 次心跳未 ACK，距上次 ACK ${Math.round(sinceAck / 1000)}s`,
+        )
+        // 假死意味着服务端侧的会话大概率已失效，放弃 Resume，下一轮重新 Identify
+        this.sessionId = null
+        this.lastSeq = null
+        this.resumeAttempted = false
+        this.cleanup()
+        this.opts.disconnected()
+        this.scheduleReconnect()
+        return
+      }
+      this.pendingHeartbeats++
       this.ws?.send(JSON.stringify({ op: OP_HEARTBEAT, d: this.lastSeq }))
     }, intervalMs)
   }

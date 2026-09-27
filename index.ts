@@ -266,6 +266,10 @@ export default {
         pusher.setOnline(false)
         log("WARN", "网关连接断开，正在重连")
       },
+      onStale: (detail: string) => {
+        pusher.setOnline(false)
+        log("WARN", `网关心跳假死（${detail}），强制重连`)
+      },
       message: async (msg: any) => {
         let stream: ReturnType<typeof beginStream> = null
         try {
@@ -421,6 +425,18 @@ export default {
       ensureRunning()
     }
 
+    // 不变量：只有持锁实例可以运行网关。
+    // 热重载并不保证调用插件 dispose，因此不能只依赖清理函数——
+    // 一旦发现自己已不是锁持有者，本实例必须主动停掉网关，否则会留下多条 WS 会话
+    //（表现为重复收消息、被平台踢下线）。
+    const guardTimer = setInterval(() => {
+      if (gateway && !lock.isHeld) {
+        log("WARN", `pid=${process.pid} 已失去网关锁，主动停止本实例网关`)
+        gateway.stop()
+        gateway = null
+      }
+    }, 10_000)
+
     // ── 配置热更新 ──────────────────────────────────────────────────────────
     const applyConfig = (next: QqConfig | null): void => {
       cfg = next
@@ -479,9 +495,12 @@ export default {
     return () => {
       abort.abort()
       clearInterval(configTimer)
+      clearInterval(guardTimer)
       if (lockTimer) clearInterval(lockTimer)
       clearInterval(flushTimer)
       assistantBuf.clearAll()
+      // 早期版本 dispose 不写日志，导致「网关悄悄停了」很难排查
+      if (gateway) log("INFO", `插件卸载，网关已停止 pid=${process.pid}`)
       gateway?.stop()
       lock.release()
       pusher.dispose()

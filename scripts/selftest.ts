@@ -9,7 +9,7 @@ import { AssistantTextBuffer } from "../src/text-buffer"
 import { SessionManager } from "../src/session-manager"
 import { V2Bridge } from "../src/bridge"
 import { InstanceLock } from "../src/lock"
-import { parseC2CMessage } from "../src/qq/gateway"
+import { parseC2CMessage, isHeartbeatStale } from "../src/qq/gateway"
 import { QQApi, __resetSeqCounters } from "../src/qq/api"
 import { defaultWorkspaceName, findWorkspace, resolveWorkspaces } from "../src/workspaces"
 import { splitText } from "../src/util/chunk"
@@ -478,6 +478,16 @@ section("QQApi：msg_seq 计数器必须跨实例共享（热重载回归）")
   eq("主动消息不带 msg_id", bodies.at(-1)?.msg_id, undefined)
 
   __resetSeqCounters()
+}
+
+section("网关心跳假死判定（掉线不自知的回归）")
+{
+  const interval = 45_000
+  eq("刚发心跳、ACK 正常 → 不判假死", isHeartbeatStale(0, 0, interval), false)
+  eq("发过 1 次未 ACK、时间未超 → 不判假死", isHeartbeatStale(1, interval, interval), false)
+  eq("连续 2 次未 ACK → 判假死", isHeartbeatStale(2, interval, interval), true)
+  eq("距上次 ACK 超 3 个周期 → 判假死", isHeartbeatStale(0, interval * 3 + 1, interval), true)
+  eq("恰好 3 个周期不判（边界）", isHeartbeatStale(0, interval * 3, interval), false)
 }
 
 // ── 汇总 ────────────────────────────────────────────────────────────────────
