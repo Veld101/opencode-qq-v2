@@ -1,0 +1,336 @@
+/**
+ * 无需 QQ 凭据的逻辑自测。
+ * 覆盖：文本分块 / 权限审批解析 / V2 文本缓冲 / 会话管理 / V2 宿主桥接 / 节流器。
+ *
+ * 用法：bun scripts/selftest.ts
+ */
+import { Approver } from "../src/approver"
+import { AssistantTextBuffer } from "../src/text-buffer"
+import { SessionManager } from "../src/session-manager"
+import { V2Bridge } from "../src/bridge"
+import { InstanceLock } from "../src/lock"
+import { parseC2CMessage } from "../src/qq/gateway"
+import { splitText } from "../src/util/chunk"
+import { Throttler } from "../src/util/throttle"
+import { parseCommand } from "../src/commands"
+import fs from "node:fs"
+import path from "node:path"
+import type { HostBridge, InboundEvent } from "../src/types"
+
+let passed = 0
+let failed = 0
+
+function eq(label: string, actual: unknown, expected: unknown): void {
+  const a = JSON.stringify(actual)
+  const e = JSON.stringify(expected)
+  if (a === e) {
+    passed++
+    console.log(`  ✅ ${label}`)
+  } else {
+    failed++
+    console.log(`  ❌ ${label}\n      期望: ${e}\n      实际: ${a}`)
+  }
+}
+function truthy(label: string, value: unknown): void {
+  eq(label, !!value, true)
+}
+function section(name: string): void {
+  console.log(`\n── ${name} ──`)
+}
+
+// ── splitText ───────────────────────────────────────────────────────────────
+section("splitText：UTF-8 字节边界")
+{
+  eq("短文本不切分", splitText("你好"), ["你好"])
+  eq("空文本返回空数组", splitText(""), [])
+  const long = "字".repeat(700) // 2100 字节 > 1900
+  const chunks = splitText(long)
+  truthy("超长被切分", chunks.length > 1)
+  truthy(
+    "每片都不超 1900 字节",
+    chunks.every((c) => Buffer.byteLength(c, "utf8") <= 1900),
+  )
+  eq("拼接后无损", chunks.join(""), long)
+}
+
+// ── Approver ────────────────────────────────────────────────────────────────
+section("Approver：远程审批")
+{
+  const ap = new Approver(1000)
+  const seq = ap.register("ses_1", "per_1", "执行命令: npm test")
+  eq("编号从 1 开始", seq, 1)
+  truthy("render 含编号", ap.render(seq).includes("#1"))
+  eq("解析 同意", ap.parseReply("同意 1"), { reply: "once", seq: 1 })
+  eq("解析 拒绝", ap.parseReply("拒绝 1"), { reply: "reject", seq: 1 })
+  eq("解析 总是", ap.parseReply("总是 1"), { reply: "always", seq: 1 })
+  eq("容忍空白", ap.parseReply("  同意  1  "), { reply: "once", seq: 1 })
+  eq("无关文本不解析", ap.parseReply("同意吧"), null)
+  eq("计数正确", ap.countBySession("ses_1"), 1)
+  const item = ap.confirm(seq)
+  eq("confirm 返回 permissionId", item?.permissionId, "per_1")
+  eq("confirm 后出队", ap.countBySession("ses_1"), 0)
+  eq("重复 confirm 返回 undefined", ap.confirm(seq), undefined)
+
+  const ap2 = new Approver(50)
+  ap2.register("ses_2", "per_2", "x")
+  await new Promise((r) => setTimeout(r, 80))
+  eq("超时后自动清理", ap2.countBySession("ses_2"), 0)
+
+  const ap3 = new Approver(1000)
+  ap3.register("ses_3", "p1", "a")
+  ap3.register("ses_3", "p2", "b")
+  ap3.register("ses_4", "p3", "c")
+  ap3.clearSession("ses_3")
+  eq("clearSession 只清目标会话", ap3.countBySession("ses_3"), 0)
+  eq("clearSession 不影响他人", ap3.countBySession("ses_4"), 1)
+}
+
+// ── AssistantTextBuffer（V2 事件形状）────────────────────────────────────────
+section("AssistantTextBuffer：V2 流式文本")
+{
+  let our = true
+  const buf = new AssistantTextBuffer(() => our)
+  const ev = (type: string, data: Record<string, any>): InboundEvent => ({ type, data })
+
+  buf.handle(ev("session.text.started", { sessionID: "ses_1", assistantMessageID: "msg_a", ordinal: 0 }))
+  buf.handle(ev("session.text.delta", { sessionID: "ses_1", assistantMessageID: "msg_a", ordinal: 0, delta: "你" }))
+  buf.handle(ev("session.text.delta", { sessionID: "ses_1", assistantMessageID: "msg_a", ordinal: 0, delta: "好" }))
+  eq("delta 增量累计", buf.text("ses_1"), "你好")
+
+  // 第二个文本段（ordinal 递增）追加而非覆盖
+  buf.handle(ev("session.text.delta", { sessionID: "ses_1", assistantMessageID: "msg_a", ordinal: 1, delta: "世界" }))
+  eq("多段按序拼接", buf.text("ses_1"), "你好世界")
+
+  // ended 用全量覆盖，修正丢片
+  buf.handle(ev("session.text.ended", { sessionID: "ses_1", assistantMessageID: "msg_a", ordinal: 0, text: "你好啊" }))
+  eq("ended 全量覆盖", buf.text("ses_1"), "你好啊世界")
+
+  our = false
+  buf.handle(ev("session.text.delta", { sessionID: "ses_other", assistantMessageID: "m", ordinal: 0, delta: "x" }))
+  eq("非本插件会话不接收", buf.text("ses_other"), null)
+
+  buf.clear("ses_1")
+  eq("clear 生效", buf.text("ses_1"), null)
+}
+
+// ── SessionManager（含 V2 桥接）──────────────────────────────────────────────
+section("V2Bridge：V2 宿主接口换形")
+{
+  const calls: string[] = []
+  const messages: any[] = []
+  let createdInput: any = null
+  let defaultModel: any = { providerID: "prov", modelID: "def-model" }
+  const ctx = {
+    model: {
+      async default() {
+        return defaultModel
+      },
+    },
+    session: {
+      async create(input: any) {
+        calls.push("create")
+        createdInput = input
+        return { id: "ses_new", title: input.title }
+      },
+      async synthetic(input: any) {
+        calls.push("synthetic")
+        return {}
+      },
+      async prompt(input: any) {
+        calls.push("prompt")
+        messages.push({ id: "msg_u1", type: "user", content: [] })
+        messages.push({
+          id: "msg_a1",
+          type: "assistant",
+          content: [{ type: "reasoning", text: "思考中" }, { type: "text", text: "来自 OpenCode 的回复" }],
+        })
+        return {}
+      },
+      async wait(input: any) {
+        calls.push("wait")
+        return undefined
+      },
+      async context(input: any) {
+        return messages
+      },
+    },
+  }
+
+  const bridge = new V2Bridge(ctx)
+  bridge.configure({ model: "anthropic/claude-sonnet-4-5", workdir: "D:/workspace/opencode" })
+  const created = await bridge.sessionCreate("标题")
+  eq("create 返回 id", created.id, "ses_new")
+  truthy("create 已调用", calls.includes("create"))
+  eq("显式配置的模型被传入（providerID/id 形状）", createdInput.model, {
+    providerID: "anthropic",
+    id: "claude-sonnet-4-5",
+  })
+  eq("固定 workdir 通过 location 传入", createdInput.location, { directory: "D:/workspace/opencode" })
+
+  const bridgeDefault = new V2Bridge(ctx)
+  bridgeDefault.configure({})
+  await bridgeDefault.sessionCreate("标题2")
+  eq("未配置时回退到全局默认模型（modelID → id）", createdInput.model, { providerID: "prov", id: "def-model" })
+  eq("未配置 workdir 时不传 location", createdInput.location, undefined)
+
+  // 热换模型：configure 必须让解析缓存失效
+  const bridgeHot = new V2Bridge(ctx)
+  bridgeHot.configure({ model: "p1/m1" })
+  await bridgeHot.sessionCreate("a")
+  eq("模型 A 生效", createdInput.model, { providerID: "p1", id: "m1" })
+  bridgeHot.configure({ model: "p2/m2" })
+  await bridgeHot.sessionCreate("b")
+  eq("热换模型后缓存失效、新模型生效", createdInput.model, { providerID: "p2", id: "m2" })
+
+  defaultModel = undefined
+  const bridgeNone = new V2Bridge({ ...ctx, model: { default: async () => undefined } })
+  bridgeNone.configure({})
+  let threw = ""
+  try {
+    await bridgeNone.sessionCreate("标题3")
+  } catch (e) {
+    threw = String(e)
+  }
+  truthy("无模型可用时抛出明确错误", threw.includes("未配置模型"))
+
+  const r = await bridge.sessionPrompt("ses_new", "你好", false)
+  eq("从 context 提取 assistant 的 text part", r.text, "来自 OpenCode 的回复")
+  truthy("调用了 wait", calls.includes("wait"))
+  truthy("调用了 prompt", calls.includes("prompt"))
+  eq("in-flight 已复位", bridge.isInFlight("ses_new"), false)
+
+  calls.length = 0
+  await bridge.sessionPrompt("ses_new", "引导语", true)
+  truthy("noReply 走 synthetic", calls.includes("synthetic"))
+  eq("noReply 不触发模型", calls.includes("prompt"), false)
+}
+
+section("SessionManager：指令与派发")
+{
+  const sent: any[] = []
+  const fake: HostBridge = {
+    async sessionCreate(title: string) {
+      return { id: "ses_x" }
+    },
+    async sessionPrompt(_id, text, noReply) {
+      sent.push({ text, noReply })
+      return { text: noReply ? "" : `回复:${text}` }
+    },
+  }
+  const tmp = `D:/Data/Temp/opencode/selftest-sessions-${Date.now()}.json`
+  const sm = new SessionManager(fake, tmp, undefined as any, () => 0)
+
+  eq("指令 /help", (await sm.dispatch("user1", "/help")).includes("opencode-qq 指令"), true)
+  eq("普通消息得到回复", await sm.dispatch("user1", "你好"), "回复:你好")
+  truthy("会话已建立", (await sm.getSessionId("user1")) !== null)
+  truthy("首次会话带人设引导", sent[0]?.noReply === true)
+  eq("指令 /new 重置", (await sm.dispatch("user1", "/new")).includes("已重置"), true)
+  eq("重置后无会话", await sm.getSessionId("user1"), null)
+  eq("未知斜杠指令透传给模型", await sm.dispatch("user1", "/init"), "回复:/init")
+  eq("parseCommand 只认白名单", parseCommand("/foo"), null)
+
+  await sm.dispatch("user2", "hi")
+  truthy("user2 已建会话", (await sm.getSessionId("user2")) !== null)
+  sm.resetAll()
+  eq("resetAll 清空 user1", await sm.getSessionId("user1"), null)
+  eq("resetAll 清空 user2", await sm.getSessionId("user2"), null)
+}
+
+// ── Throttler ───────────────────────────────────────────────────────────────
+section("Throttler：节流聚合")
+{
+  const flushed: Array<{ key: string; lines: string[] }> = []
+  const t = new Throttler(40, (key, lines) => flushed.push({ key, lines }))
+  t.push("a", "1")
+  t.push("a", "2")
+  t.push("b", "9")
+  eq("窗口内不 flush", flushed.length, 0)
+  await new Promise((r) => setTimeout(r, 90))
+  eq("到点按 key 聚合", flushed.length, 2)
+  eq("a 聚合两条", flushed.find((f) => f.key === "a")?.lines, ["1", "2"])
+  eq("b 独立", flushed.find((f) => f.key === "b")?.lines, ["9"])
+}
+
+// ── InstanceLock ────────────────────────────────────────────────────────────
+section("InstanceLock：跨进程互斥")
+{
+  // 指定独立目录，避免污染真实配置目录
+  const dir = `D:/Data/Temp/opencode/locktest-${Date.now()}`
+  fs.mkdirSync(dir, { recursive: true })
+  process.env.OPENCODE_QQ_CONFIG_DIR = dir
+
+  const a = new InstanceLock("gw", 60_000)
+  const b = new InstanceLock("gw", 60_000)
+  eq("A 抢到锁", a.acquire(), true)
+  eq("A 重复抢返回 true", a.acquire(), true)
+  eq("B 抢不到（同进程不同实例也不行）", b.acquire(), false)
+  a.release()
+  eq("A 释放后 B 可抢", b.acquire(), true)
+  eq("B 持有中", b.isHeld, true)
+  b.release()
+
+  // 模拟持锁进程崩溃：心跳已过期
+  const lockFile = path.join(dir, "gw.lock")
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: 999999, token: "dead", at: Date.now() - 10_000 }))
+  const c = new InstanceLock("gw", 1_000)
+  eq("陈旧锁可被接管", c.acquire(), true)
+  eq("接管后持有", c.isHeld, true)
+  c.release()
+  eq("释放后锁文件已删除", fs.existsSync(lockFile), false)
+
+  // 回归：旧持有者在新持有者接管后 release，绝不能删掉新持有者的锁
+  const d = new InstanceLock("gw2", 1_000)
+  const e = new InstanceLock("gw2", 1_000)
+  const lock2 = path.join(dir, "gw2.lock")
+  eq("D 抢到", d.acquire(), true)
+  // 伪造 D 心跳过期（别人写的锁），使 E 合法接管
+  fs.writeFileSync(lock2, JSON.stringify({ pid: 999999, token: "stale", at: Date.now() - 10_000 }))
+  eq("E 接管陈旧锁", e.acquire(), true)
+  d.release()
+  eq("旧持有者 release 不影响新持有者（回归）", fs.existsSync(lock2), true)
+  eq("新持有者仍持有", e.isHeld, true)
+  e.release()
+  eq("新持有者释放后才删除锁文件", fs.existsSync(lock2), false)
+
+  delete process.env.OPENCODE_QQ_CONFIG_DIR
+}
+
+// ── parseC2CMessage ─────────────────────────────────────────────────────────
+section("parseC2CMessage：字段形状兼容（线上 bug 回归）")
+{
+  // QQ 官方单聊(v2) 真实形状：用户标识在 author.user_openid，消息 id 在 d.id
+  const official = {
+    id: "ROBOT1.0_abc",
+    author: { id: "u1", user_openid: "OPENID_A" },
+    content: "你好",
+    timestamp: "2026-09-27T14:33:19.000Z",
+  }
+  const m1 = parseC2CMessage(official)
+  eq("官方形状：openid 取 author.user_openid", m1.openid, "OPENID_A")
+  eq("官方形状：msgId 取 d.id", m1.msgId, "ROBOT1.0_abc")
+  eq("官方形状：content", m1.content, "你好")
+  truthy("官方形状：timestamp 可解析", m1.timestamp > 0)
+
+  // 旧版 / 频道风格：顶层 openid + msg_id
+  const m2 = parseC2CMessage({ openid: "OPENID_B", msg_id: "msg_2", content: "hi" })
+  eq("旧形状：openid", m2.openid, "OPENID_B")
+  eq("旧形状：msgId", m2.msgId, "msg_2")
+
+  // 字段缺失不得抛异常
+  const m3 = parseC2CMessage({})
+  eq("缺字段：openid 为空串（由上层拒绝并报错）", m3.openid, "")
+  eq("缺字段：msgId 为空串", m3.msgId, "")
+
+  // 图片附件识别
+  const m4 = parseC2CMessage({
+    id: "x",
+    author: { user_openid: "o" },
+    attachments: [{ content_type: "image", url: "https://example.com/a.png" }],
+  })
+  eq("图片附件被识别", m4.attachments.length, 1)
+  eq("非图片附件被过滤", parseC2CMessage({ attachments: [{ content_type: "file", url: "x" }] }).attachments.length, 0)
+}
+
+// ── 汇总 ────────────────────────────────────────────────────────────────────
+console.log(`\n════════ 结果：${passed} 通过 / ${failed} 失败 ════════`)
+process.exit(failed === 0 ? 0 : 1)

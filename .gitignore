@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.log
+logs/
+.DS_Store
+
+# 本地机密：绝不提交
+opencode-qq.json
+.env
+*.local.json
+opencode-qq-sessions.json

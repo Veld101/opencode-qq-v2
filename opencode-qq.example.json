@@ -1,0 +1,11 @@
+{
+  "appId": "REPLACE_ME_APPID",
+  "appSecret": "REPLACE_ME_APPSECRET",
+  "sandbox": true,
+  "allowlist": [],
+  "markdownReply": true,
+  "streaming": false,
+  "events": {
+    "toolProgress": false
+  }
+}
