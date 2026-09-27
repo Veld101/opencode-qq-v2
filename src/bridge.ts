@@ -137,6 +137,9 @@ export class V2Bridge implements HostBridge {
 
   private async waitForReply(sessionId: string, beforeId: string | null): Promise<string> {
     const deadline = Date.now() + REPLY_TIMEOUT_MS
+    // context() 返回整个会话记录，读取成本随会话增长。
+    // 首轮短间隔以尽快拿到结果，之后退避，避免长回合里高频全量读取。
+    let delay = 300
     while (Date.now() < deadline) {
       try {
         await this.ctx.session.wait({ sessionID: sessionId })
@@ -145,7 +148,8 @@ export class V2Bridge implements HostBridge {
       }
       const found = await this.readLastAssistant(sessionId)
       if (found && found.id !== beforeId) return found.text
-      await new Promise((r) => setTimeout(r, 500))
+      await new Promise((r) => setTimeout(r, delay))
+      delay = Math.min(Math.round(delay * 1.5), 3_000)
     }
     return "(等待 OpenCode 回复超时)"
   }

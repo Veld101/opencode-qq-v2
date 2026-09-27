@@ -42,6 +42,15 @@ export function __resetSeqCounters(): void {
   seqCounters.clear()
 }
 
+/**
+ * 为流式发送（stream_messages）预留一个被动回复序号。
+ * 必须走同一张表，否则会与普通被动回复（ack / 最终回答）撞号触发 40054005。
+ * 返回 undefined 表示额度已用尽，调用方应放弃流式走普通回复。
+ */
+export function reserveSeq(msgId?: string): number | undefined {
+  return nextSeq(msgId)
+}
+
 /** QQ 单聊消息发送。串行化所有发送以避免打爆频控，并管理被动回复额度。 */
 export class QQApi {
   private fetchFn: typeof fetch

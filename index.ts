@@ -6,7 +6,7 @@ import fs from "node:fs"
 import { Approver } from "./src/approver"
 import { loadConfig } from "./src/config"
 import { QQGateway, createGatewayUrlFetcher } from "./src/qq/gateway"
-import { QQApi } from "./src/qq/api"
+import { QQApi, reserveSeq } from "./src/qq/api"
 import { AuthManager } from "./src/qq/auth"
 import { StreamSender } from "./src/qq/stream"
 import { EventPusher } from "./src/event-pusher"
@@ -78,6 +78,11 @@ export default {
       return null
     }
 
+    const sessionIdOf = (openid: string): string | null => sessions.snapshot()[openid] ?? null
+
+    /** 延迟埋点：openid → 本回合时间线，用于定位「到底慢在哪」 */
+    const timings = new Map<string, { t0: number; firstTextAt: number | null }>()
+
     const pusher = new EventPusher({
       isOurSession: (sid) => sessions.isOurSession(sid),
       openidOfSession,
@@ -103,9 +108,20 @@ export default {
       if (openid) void replyTo(openid, approver.render(seq))
     })
 
-    // 文本缓冲：供流式与「任务完成」摘要使用
+    // 文本缓冲：供流式、进度提示与「任务完成」摘要使用
     listeners.push((e) => {
       assistantBuf.handle(e)
+
+      // 埋点：本回合首个文本片出现的时间（= 用户视角的「首字延迟」）
+      if (e.type === "session.text.delta" || e.type === "session.text.ended") {
+        const sid = String(e.data?.sessionID ?? "")
+        const openid = sid ? openidOfSession(sid) : null
+        if (openid) {
+          const t = timings.get(openid)
+          if (t && t.firstTextAt === null) t.firstTextAt = Date.now()
+        }
+      }
+
       if (e.type === "session.idle" || e.type === "session.execution.failed" || e.type === "session.execution.succeeded") {
         const sid = String(e.data?.sessionID ?? "")
         if (sid) setTimeout(() => assistantBuf.clear(sid), 5000)
@@ -133,15 +149,21 @@ export default {
     // ── 下行：QQ 消息处理 ───────────────────────────────────────────────────
     const passiveRefs = new Map<string, { msgId: string; receivedAt: number }>()
     const pendingNotice = new Map<string, string>()
-    const streams = new Map<string, { sender: StreamSender | null; msgId: string; lastLen: number }>()
+    const streams = new Map<
+      string,
+      { sender: StreamSender | null; msgId: string; msgSeq: number; lastLen: number }
+    >()
 
     const beginStream = (openid: string) => {
       if (!cfg?.streaming) return null
       const ref = passiveRefs.get(openid)
       if (!ref) return null
+      // 预留一个被动序号；额度不足就不走流式，把额度留给最终回答
+      const msgSeq = reserveSeq(ref.msgId)
+      if (msgSeq === undefined) return null
       const old = streams.get(openid)
       if (old?.sender) old.sender.failed = true
-      const ctxStream = { sender: null as StreamSender | null, msgId: ref.msgId, lastLen: 0 }
+      const ctxStream = { sender: null as StreamSender | null, msgId: ref.msgId, msgSeq, lastLen: 0 }
       streams.set(openid, ctxStream)
       return ctxStream
     }
@@ -191,16 +213,30 @@ export default {
       }
     }
 
-    /** 长任务心跳：处理超过 60 秒后每 60 秒提示一次，最多 5 次，返回停止函数 */
-    function startHeartbeat(openid: string): () => void {
+    /**
+     * 长任务进度心跳（借鉴 @soulglad「状态感知 + 续消息」的思路）。
+     *
+     * - 首次 20 秒即提示，避免用户以为卡死（原先要等 60 秒）
+     * - 之后每约 40 秒一次，最多 5 次
+     * - 若已产生文本则附带片段末 80 字，让用户看到确实在推进
+     * - 走主动消息，不占用每条消息 4 次的被动回复额度
+     */
+    function startHeartbeat(openid: string, snippet: () => string | null): () => void {
       const startedAt = Date.now()
       let sent = 0
+      let lastPingAt = 0
       const timer = setInterval(() => {
+        const now = Date.now()
+        const elapsed = now - startedAt
+        if (elapsed < 20_000) return
         if (sent >= 5) return
+        if (now - lastPingAt < 40_000) return
         sent++
-        const secs = Math.round((Date.now() - startedAt) / 1000)
-        void notifyQuietly(openid, `⏳ 仍在处理…（已 ${secs} 秒）`)
-      }, 60_000)
+        lastPingAt = now
+        const tail = (snippet() ?? "").replace(/\s+/g, " ").trim().slice(-80)
+        const head = `⏳ 仍在处理…（已 ${Math.round(elapsed / 1000)} 秒）`
+        void notifyQuietly(openid, tail ? `${head}\n最新：…${tail}` : head)
+      }, 5_000)
       return () => clearInterval(timer)
     }
 
@@ -276,13 +312,19 @@ export default {
             (files.length ? `[图片 x${files.length}] ` : "") +
             msg.content
 
+          const timing = { t0: Date.now(), firstTextAt: null as number | null }
+          timings.set(msg.openid, timing)
           stream = beginStream(msg.openid)
-          const stopHeartbeat = startHeartbeat(msg.openid)
+          const stopHeartbeat = startHeartbeat(msg.openid, () => {
+            const sid = sessionIdOf(msg.openid)
+            return sid ? assistantBuf.text(sid) : null
+          })
           let answer: string
           try {
             answer = await sessions.dispatch(msg.openid, promptText, files)
           } finally {
             stopHeartbeat()
+            timings.delete(msg.openid)
           }
           const deliveredByStream = endStream(msg.openid, answer, stream)
           let delivered = true
@@ -293,9 +335,12 @@ export default {
               cfg?.markdownReply ? "markdown" : "text",
             )
           }
+          const firstTextMs = timing.firstTextAt === null ? null : timing.firstTextAt - timing.t0
           log(
             delivered ? "INFO" : "ERROR",
-            `${delivered ? "已回复" : "回复未送达"} openid=${msg.openid} 字数=${answer.length} 流式=${deliveredByStream}`,
+            `${delivered ? "已回复" : "回复未送达"} openid=${msg.openid} 字数=${answer.length} ` +
+              `流式=${deliveredByStream} 首字=${firstTextMs === null ? "无" : `${firstTextMs}ms`} ` +
+              `总耗时=${Date.now() - timing.t0}ms`,
           )
         } catch (e) {
           if (stream && streams.get(msg.openid) === stream) streams.delete(msg.openid)
@@ -316,7 +361,7 @@ export default {
         if (!s.sender) {
           s.sender = new StreamSender(
             { restBase, getToken: () => auth!.getToken() },
-            { openid, msgId: s.msgId, msgSeq: 2 },
+            { openid, msgId: s.msgId, msgSeq: s.msgSeq },
           )
         }
         if (bufText.length <= s.lastLen) continue
