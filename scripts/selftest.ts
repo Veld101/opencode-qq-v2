@@ -10,6 +10,7 @@ import { SessionManager } from "../src/session-manager"
 import { V2Bridge } from "../src/bridge"
 import { InstanceLock } from "../src/lock"
 import { parseC2CMessage } from "../src/qq/gateway"
+import { QQApi, __resetSeqCounters } from "../src/qq/api"
 import { splitText } from "../src/util/chunk"
 import { Throttler } from "../src/util/throttle"
 import { parseCommand } from "../src/commands"
@@ -329,6 +330,46 @@ section("parseC2CMessage：字段形状兼容（线上 bug 回归）")
   })
   eq("图片附件被识别", m4.attachments.length, 1)
   eq("非图片附件被过滤", parseC2CMessage({ attachments: [{ content_type: "file", url: "x" }] }).attachments.length, 0)
+}
+
+// ── QQApi：msg_seq 跨实例共享（40054005 回归）────────────────────────────────
+section("QQApi：msg_seq 计数器必须跨实例共享（热重载回归）")
+{
+  __resetSeqCounters()
+  const bodies: Array<Record<string, any>> = []
+  const fakeFetch = (async (_url: string, init: any) => {
+    bodies.push(JSON.parse(init.body))
+    return new Response(JSON.stringify({ id: "m1" }), { status: 200, headers: { "Content-Type": "application/json" } })
+  }) as unknown as typeof fetch
+  const opts = { restBase: "https://example.invalid", getToken: async () => "t", fetchFn: fakeFetch }
+
+  const apiA = new QQApi(opts)
+  await apiA.sendC2C("openid1", "ack", { msgId: "MSG1" })
+  eq("实例 A 首次使用 seq=1", bodies.at(-1)?.msg_seq, 1)
+  eq("被动回复带 msg_id", bodies.at(-1)?.msg_id, "MSG1")
+
+  // 模拟配置热重载：重建 QQApi（旧实现会在此清零计数器 → 重复 seq=1 → 40054005）
+  const apiB = new QQApi(opts)
+  await apiB.sendC2C("openid1", "answer", { msgId: "MSG1" })
+  eq("重建实例后 seq 递增为 2（回归）", bodies.at(-1)?.msg_seq, 2)
+
+  // 不同 msg_id 各自独立计数
+  await apiB.sendC2C("openid1", "ack2", { msgId: "MSG2" })
+  eq("新 msg_id 从 seq=1 开始", bodies.at(-1)?.msg_seq, 1)
+
+  // 额度用尽后降级为主动消息（不带 msg_id / msg_seq）
+  await apiB.sendC2C("openid1", "3", { msgId: "MSG1" })
+  await apiB.sendC2C("openid1", "4", { msgId: "MSG1" })
+  await apiB.sendC2C("openid1", "overflow", { msgId: "MSG1" })
+  const overflow = bodies.at(-1)!
+  eq("超出额度后不再带 msg_id", overflow.msg_id, undefined)
+  eq("超出额度后不再带 msg_seq", overflow.msg_seq, undefined)
+
+  // 不带 msgId 即主动消息
+  await apiB.sendC2C("openid1", "proactive")
+  eq("主动消息不带 msg_id", bodies.at(-1)?.msg_id, undefined)
+
+  __resetSeqCounters()
 }
 
 // ── 汇总 ────────────────────────────────────────────────────────────────────

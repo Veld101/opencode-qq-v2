@@ -155,22 +155,53 @@ export default {
       return true
     }
 
-    async function replyTo(openid: string, text: string, format: "text" | "markdown" = "text"): Promise<void> {
+    /** 发送并反馈是否真的送达（QQ 返回 HTTP 200 才算成功） */
+    async function replyTo(openid: string, text: string, format: "text" | "markdown" = "text"): Promise<boolean> {
       if (!api) {
         log("WARN", `未配置凭据，无法发送: ${text.slice(0, 40)}`)
-        return
+        return false
       }
       const ref = passiveRefs.get(openid)
+      let delivered = true
       for (const chunk of splitText(text)) {
         const usePassive = !!ref && Date.now() - ref.receivedAt < PASSIVE_WINDOW_MS
         try {
           await api.sendC2C(openid, chunk, usePassive ? { msgId: ref!.msgId, format } : { format })
         } catch (e) {
+          delivered = false
           // 早期版本静默吞掉发送异常，导致「日志显示已回复、用户却收不到」的假象
           log("ERROR", `发送失败 openid=${openid || "(空)"} passive=${usePassive}: ${String(e).slice(0, 200)}`)
           if (!usePassive) pendingNotice.set(openid, "（此前有未能送达的消息）")
         }
       }
+      return delivered
+    }
+
+    /**
+     * 尽力而为的进度提示。
+     * 走主动消息（不带 msg_id），因此**不占用被动回复额度**，
+     * 把 4 次被动额度完整留给 ack 与最终回答；失败只记 INFO，不打扰用户。
+     */
+    async function notifyQuietly(openid: string, text: string): Promise<void> {
+      if (!api) return
+      try {
+        await api.sendC2C(openid, text, { format: "text" })
+      } catch (e) {
+        log("INFO", `进度提示未送达（主动消息可能受限）: ${String(e).slice(0, 120)}`)
+      }
+    }
+
+    /** 长任务心跳：处理超过 60 秒后每 60 秒提示一次，最多 5 次，返回停止函数 */
+    function startHeartbeat(openid: string): () => void {
+      const startedAt = Date.now()
+      let sent = 0
+      const timer = setInterval(() => {
+        if (sent >= 5) return
+        sent++
+        const secs = Math.round((Date.now() - startedAt) / 1000)
+        void notifyQuietly(openid, `⏳ 仍在处理…（已 ${secs} 秒）`)
+      }, 60_000)
+      return () => clearInterval(timer)
     }
 
     // ── 网关（每次用当前配置重建，以支持热更新）──────────────────────────────
@@ -246,16 +277,26 @@ export default {
             msg.content
 
           stream = beginStream(msg.openid)
-          const answer = await sessions.dispatch(msg.openid, promptText, files)
+          const stopHeartbeat = startHeartbeat(msg.openid)
+          let answer: string
+          try {
+            answer = await sessions.dispatch(msg.openid, promptText, files)
+          } finally {
+            stopHeartbeat()
+          }
           const deliveredByStream = endStream(msg.openid, answer, stream)
+          let delivered = true
           if (!deliveredByStream) {
-            await replyTo(
+            delivered = await replyTo(
               msg.openid,
               (notice ? `${notice}\n` : "") + answer,
               cfg?.markdownReply ? "markdown" : "text",
             )
           }
-          log("INFO", `已回复 openid=${msg.openid} 字数=${answer.length} 流式=${deliveredByStream}`)
+          log(
+            delivered ? "INFO" : "ERROR",
+            `${delivered ? "已回复" : "回复未送达"} openid=${msg.openid} 字数=${answer.length} 流式=${deliveredByStream}`,
+          )
         } catch (e) {
           if (stream && streams.get(msg.openid) === stream) streams.delete(msg.openid)
           log("ERROR", `处理失败 openid=${msg.openid}: ${String(e).slice(0, 300)}`)
