@@ -227,6 +227,10 @@ export default {
         pusher.setOnline(false)
         log("WARN", `网关心跳假死（${detail}），强制重连`)
       },
+      onClose: (code: number, reason: string) => {
+        // 4009=会话过期 / 4006=无效会话 / 1000=正常关闭 / 1006=异常断开（常见于代理）
+        log("WARN", `网关连接关闭 code=${code}${reason ? ` reason=${reason}` : ""}`)
+      },
       message: async (msg: any) => {
         let stream: ReturnType<typeof beginStream> = null
         try {

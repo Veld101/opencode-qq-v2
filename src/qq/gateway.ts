@@ -24,6 +24,8 @@ export type GatewayOpts = {
   onEvent?: (type: string, data: Record<string, any>) => void
   /** 可选：心跳假死检测触发（连接还在但服务端不再响应心跳） */
   onStale?: (detail: string) => void
+  /** 可选：连接关闭（用于判断是平台主动关、代理断开还是会话过期） */
+  onClose?: (code: number, reason: string) => void
   maxSeen?: number
   reconnectBaseMs?: number
 }
@@ -164,6 +166,7 @@ export class QQGateway {
     }
 
     ws.onclose = (ev: CloseEvent) => {
+      this.opts.onClose?.(Number(ev.code ?? 0), String(ev.reason ?? ""))
       if (NON_RESUMABLE_CLOSE.has(ev.code)) {
         this.sessionId = null
         this.lastSeq = null
