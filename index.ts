@@ -77,8 +77,6 @@ export default {
 
     const openidOfSession = (sessionId: string): string | null => sessions.openidOfSession(sessionId)
 
-    const sessionIdOf = (openid: string): string | null => sessions.getSessionId(openid)
-
     /** 延迟埋点：openid → 本回合时间线，用于定位「到底慢在哪」 */
     const timings = new Map<string, { t0: number; firstTextAt: number | null; tools: number }>()
 
@@ -206,47 +204,6 @@ export default {
       return delivered
     }
 
-    /**
-     * 尽力而为的进度提示。
-     * 走主动消息（不带 msg_id），因此**不占用被动回复额度**，
-     * 把 4 次被动额度完整留给 ack 与最终回答；失败只记 INFO，不打扰用户。
-     */
-    async function notifyQuietly(openid: string, text: string): Promise<void> {
-      if (!api) return
-      try {
-        await api.sendC2C(openid, text, { format: "text" })
-      } catch (e) {
-        log("INFO", `进度提示未送达（主动消息可能受限）: ${String(e).slice(0, 120)}`)
-      }
-    }
-
-    /**
-     * 长任务进度心跳（借鉴 @soulglad「状态感知 + 续消息」的思路）。
-     *
-     * - 首次 20 秒即提示，避免用户以为卡死（原先要等 60 秒）
-     * - 之后每约 40 秒一次，最多 5 次
-     * - 若已产生文本则附带片段末 80 字，让用户看到确实在推进
-     * - 走主动消息，不占用每条消息 4 次的被动回复额度
-     */
-    function startHeartbeat(openid: string, snippet: () => string | null): () => void {
-      const startedAt = Date.now()
-      let sent = 0
-      let lastPingAt = 0
-      const timer = setInterval(() => {
-        const now = Date.now()
-        const elapsed = now - startedAt
-        if (elapsed < 20_000) return
-        if (sent >= 5) return
-        if (now - lastPingAt < 40_000) return
-        sent++
-        lastPingAt = now
-        const tail = (snippet() ?? "").replace(/\s+/g, " ").trim().slice(-80)
-        const head = `⏳ 仍在处理…（已 ${Math.round(elapsed / 1000)} 秒）`
-        void notifyQuietly(openid, tail ? `${head}\n最新：…${tail}` : head)
-      }, 5_000)
-      return () => clearInterval(timer)
-    }
-
     // ── 网关（每次用当前配置重建，以支持热更新）──────────────────────────────
     const gatewayOpts = () => ({
       getGatewayUrl: createGatewayUrlFetcher(restBase, () => auth!.getToken()),
@@ -326,15 +283,10 @@ export default {
           const timing = { t0: Date.now(), firstTextAt: null as number | null, tools: 0 }
           timings.set(msg.openid, timing)
           stream = beginStream(msg.openid)
-          const stopHeartbeat = startHeartbeat(msg.openid, () => {
-            const sid = sessionIdOf(msg.openid)
-            return sid ? assistantBuf.text(sid) : null
-          })
           let answer: string
           try {
             answer = await sessions.dispatch(msg.openid, promptText, files)
           } finally {
-            stopHeartbeat()
             timings.delete(msg.openid)
           }
           const deliveredByStream = endStream(msg.openid, answer, stream)
