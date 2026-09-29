@@ -76,29 +76,44 @@ bun install
 
 **不要**把它加进 `opencode.json` 的 `plugins` —— 独立进程自己通过 HTTP API 连 OpenCode。
 
-先手工确认能跑：
+**日常使用：双击桌面的「QQ机器人」快捷方式**（指向本仓库根目录的 `start-bridge.cmd`）。
+会弹出一个控制台窗口：
+
+- **关闭窗口即停止**
+- 桥进程意外退出会自动重启（5 秒）
+- 窗口标题即为状态提示；日志见 `~/.config/opencode/opencode-qq.log`
+
+若窗口丢失、后台还有残留，用兜底脚本：
+
+```powershell
+pwsh -File scripts/stop.ps1
+```
+
+也可以在终端直接跑：
 
 ```bash
-bun bridge.ts
+bun bridge.ts        # 或 cmd /c start-bridge.cmd
 ```
 
-看到 `OpenCode 服务可达` + `网关已连接` 即正常，`Ctrl+C` 退出。
+> ⚠️ `start-bridge.cmd` **必须保持纯 ASCII 内容**。批处理文件被 `cmd.exe` 按 OEM 代码页
+> （中文系统是 GBK）解析，UTF-8 中文字节会导致语法错乱、脚本静默失败——这一坑已实测踩过。
+> 中文只放在快捷方式名字里（`.lnk` 是 UTF-16，不受影响）。
 
-然后注册「登录时自动启动 + 崩溃自动重启」的计划任务（**无需管理员**）：
+#### 可选：开机/登录自动启动
+
+如果不想每次手动点（**注意：触发条件是「登录时」，不是「开机时」**）：
 
 ```powershell
-pwsh -File scripts/install-task.ps1
+pwsh -File scripts/install-task.ps1     # 注册计划任务（无需管理员）
+pwsh -File scripts/uninstall-task.ps1   # 卸载
 ```
 
-它会创建计划任务 `opencode-qq-bridge`：登录后延迟 30 秒启动 `scripts/supervisor.ps1`，
-由守护脚本拉起并看护 `bun bridge.ts`，桥进程退出后 5 秒自动重启。
+任务 `opencode-qq-bridge` 会在用户登录后延迟 30 秒启动 `scripts/supervisor.ps1`，
+由它拉起并看护 `bun bridge.ts`。
 
-```powershell
-schtasks /Run   /TN opencode-qq-bridge          # 立即启动
-schtasks /Query /TN opencode-qq-bridge /FO LIST # 查看状态
-schtasks /End   /TN opencode-qq-bridge          # 停止
-pwsh -File scripts/uninstall-task.ps1           # 卸载
-```
+为什么不做成真正的 Windows 服务：服务默认以 `LocalSystem` 运行，**拿不到你的用户目录**
+（配置 `~/.config/opencode/`、锁、日志都在那），也连不上**按用户注册的 OpenCode 服务**，
+需要改成「以你的账户运行」并保存 Windows 密码才行。
 
 ### 插件形态（备选）
 
@@ -329,11 +344,13 @@ src/
   qq/{auth,gateway,api,stream}.ts   QQ 官方协议实现
   util/{chunk,media,quote,throttle}.ts
 scripts/
-  supervisor.ps1          守护脚本：桥进程退出后自动重启
-  install-task.ps1        注册「登录时自启」计划任务
+  supervisor.ps1          守护脚本（可选：自动启动时用）
+  install-task.ps1        注册「登录时自启」计划任务（可选）
   uninstall-task.ps1      卸载计划任务
+  stop.ps1                停止桥进程（窗口丢失时兜底）
   probe-qq.ts             凭据 + 网关 + 收发连通性探针
   selftest.ts             无凭据逻辑自测
+start-bridge.cmd          手动启动入口（桌面快捷方式指向它；保持纯 ASCII）
 ```
 
 ## License
