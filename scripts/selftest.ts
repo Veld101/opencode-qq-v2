@@ -404,6 +404,21 @@ section("InstanceLock：跨进程互斥")
   e.release()
   eq("新持有者释放后才删除锁文件", fs.existsSync(lock2), false)
 
+  // 回归：持有进程已退出时，无需等 TTL 即可接管（硬杀后快速恢复）
+  const dead = new InstanceLock("gw3", 60_000)
+  const lock3 = path.join(dir, "gw3.lock")
+  fs.writeFileSync(lock3, JSON.stringify({ pid: 2147483646, token: "gone", at: Date.now() }))
+  eq("持有进程不存在 → 立即接管（不等 TTL）", dead.acquire(), true)
+  eq("接管后持有", dead.isHeld, true)
+  dead.release()
+
+  // 反向：持有进程就是自己时不得抢占（防止同进程多实例互抢）
+  const selfPid = new InstanceLock("gw4", 60_000)
+  const lock4 = path.join(dir, "gw4.lock")
+  fs.writeFileSync(lock4, JSON.stringify({ pid: process.pid, token: "self", at: Date.now() }))
+  eq("持有者是自己进程 → 不抢占", selfPid.acquire(), false)
+  fs.unlinkSync(lock4)
+
   delete process.env.OPENCODE_QQ_CONFIG_DIR
 }
 

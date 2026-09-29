@@ -51,11 +51,13 @@ export class InstanceLock {
       /* 已存在，继续判断是否陈旧 */
     }
 
-    // 已存在 → 只有心跳过期（原持有者已崩溃）才接管
+    // 已存在 → 持有者心跳过期，或持有进程已不存在，才接管
     try {
       const raw = this.read()
       const age = Date.now() - Number(raw?.at ?? 0)
-      if (!raw?.at || Number.isNaN(age) || age > this.ttlMs) {
+      const staleByTime = !raw?.at || Number.isNaN(age) || age > this.ttlMs
+      const ownerGone = !this.isProcessAlive(Number(raw?.pid))
+      if (staleByTime || ownerGone) {
         fs.writeFileSync(this.file, JSON.stringify(this.payload()))
         this.onAcquired()
         return true
@@ -64,6 +66,22 @@ export class InstanceLock {
       /* 读取/解析失败一律视为被占用，避免抢占正在初始化的持有者 */
     }
     return false
+  }
+
+  /**
+   * 判断锁持有进程是否还活着。
+   * 同进程直接视为活着——同进程内多实例的互斥交由令牌逻辑处理，
+   * 否则后加载的实例会把先前实例的锁抢走，导致同时存在两个网关。
+   */
+  private isProcessAlive(pid: number): boolean {
+    if (!pid || pid === process.pid) return true
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch (e: any) {
+      // EPERM：进程存在但无权限 → 视为活着；ESRCH/EINVAL 等 → 视为已退出
+      return e?.code === "EPERM"
+    }
   }
 
   private payload(): LockFile {
