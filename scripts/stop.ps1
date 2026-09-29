@@ -46,12 +46,7 @@ $cfgDir = if ($Bot) { Join-Path $env:USERPROFILE ".config\opencode\bots\$Bot" } 
 $lock = Join-Path $cfgDir 'opencode-qq-gateway.lock'
 if (Test-Path $lock) {
     $raw = Get-Content $lock -Raw | ConvertFrom-Json
-    $alive = $false
-    try {
-        process.kill([int]$raw.pid, 0)
-        $alive = $true
-    } catch {
-        $alive = $false
-    }
+    # PowerShell 里没有 process.kill()，用 Get-Process 判断存活
+    $alive = $null -ne (Get-Process -Id ([int]$raw.pid) -ErrorAction SilentlyContinue)
     Write-Host ("网关锁: {0}  pid={1}  {2}" -f $lock, $raw.pid, $(if ($alive) { '仍存活' } else { '已退出，下次启动将立即接管' }))
 }

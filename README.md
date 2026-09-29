@@ -426,6 +426,7 @@ scripts/
   icon-lib.ps1            .ico 生成共享实现（供上面两个图标脚本复用）
   probe-qq.ts             凭据 + 网关 + 收发连通性探针
   selftest.ts             无凭据逻辑自测
+  start-all.ps1           拉起所有机器人（配置几个启动几个；已在运行的跳过）
 assets/
   qqbot.ico               默认机器人的图标（桌面快捷方式引用）
   run-all.ico             管理快捷方式图标「全部启动」
@@ -433,7 +434,6 @@ assets/
   bots/<name>.ico         各机器人实例图标（由 new-bot.ps1 生成）
 start-bridge.cmd          手动启动入口（桌面快捷方式指向它；保持纯 ASCII）
                           无参数 = 默认实例；`start-bridge.cmd <bot>` = 多机器人实例
-start-all.cmd             拉起所有机器人（每个一个窗口；保持纯 ASCII）
 stop-all.cmd              停止所有机器人（包装 scripts/stop.ps1；保持纯 ASCII）
 ```
 

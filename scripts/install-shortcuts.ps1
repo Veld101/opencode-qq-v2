@@ -24,18 +24,27 @@ if (-not (Test-Path -LiteralPath $stopIcon)) { & (Join-Path $PSScriptRoot 'make-
 $sh = New-Object -ComObject WScript.Shell
 
 function New-Shortcut {
-    param([string]$Path, [string]$Target, [string]$Icon, [string]$Desc)
+    param([string]$Path, [string]$Target, [string]$Arguments, [string]$Icon, [string]$Desc)
     $lnk = $sh.CreateShortcut($Path)
     $lnk.TargetPath       = $Target
+    $lnk.Arguments        = $Arguments
     $lnk.WorkingDirectory = $repo
     $lnk.IconLocation     = "$Icon,0"
     $lnk.Description      = $Desc
     $lnk.Save()
 }
 
-New-Shortcut -Path (Join-Path $shortcutDir 'QQ机器人-全部启动.lnk') -Target (Join-Path $repo 'start-all.cmd') -Icon $runIcon  -Desc '启动所有已配置的 QQ 机器人（已在运行的会自动跳过）'
-New-Shortcut -Path (Join-Path $shortcutDir 'QQ机器人-全部停止.lnk') -Target (Join-Path $repo 'stop-all.cmd')  -Icon $stopIcon -Desc '停止所有 QQ 机器人桥进程'
+# 「全部启动」直接指向 PowerShell 脚本（单一实现，无需 cmd 包装）
+$pwshExe = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
+if (-not $pwshExe) { $pwshExe = (Get-Command powershell -ErrorAction SilentlyContinue).Source }
+if (-not $pwshExe) { throw '找不到 pwsh/powershell' }
+$startAll = Join-Path $repo 'scripts\start-all.ps1'
+
+New-Shortcut -Path (Join-Path $shortcutDir 'QQ机器人-全部启动.lnk') -Target $pwshExe `
+    -Arguments "-NoProfile -ExecutionPolicy Bypass -File `"$startAll`"" `
+    -Icon $runIcon -Desc '启动所有已配置的 QQ 机器人（已在运行的会跳过）'
+New-Shortcut -Path (Join-Path $shortcutDir 'QQ机器人-全部停止.lnk') -Target (Join-Path $repo 'stop-all.cmd') -Arguments '' -Icon $stopIcon -Desc '停止所有 QQ 机器人桥进程'
 
 Write-Host "已创建快捷方式（$shortcutDir）:"
-Write-Host '  QQ机器人-全部启动  -> start-all.cmd'
+Write-Host '  QQ机器人-全部启动  -> pwsh scripts/start-all.ps1'
 Write-Host '  QQ机器人-全部停止  -> stop-all.cmd'

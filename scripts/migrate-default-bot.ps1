@@ -34,8 +34,8 @@ if (Test-Path -LiteralPath (Join-Path $dstDir 'opencode-qq.json')) { throw "目�
 $lock = Join-Path $cfgRoot 'opencode-qq-instance.lock'
 if (Test-Path -LiteralPath $lock) {
     $raw = Get-Content -LiteralPath $lock -Raw | ConvertFrom-Json
-    $alive = $false
-    try { process.kill([int]$raw.pid, 0); $alive = $true } catch { $alive = $false }
+    # PowerShell 里没有 process.kill()，用 Get-Process 判断存活
+    $alive = $null -ne (Get-Process -Id ([int]$raw.pid) -ErrorAction SilentlyContinue)
     if ($alive) {
         throw "默认实例仍在运行（pid=$($raw.pid)）。请先关闭它的窗口，或执行 pwsh -File scripts/stop.ps1，再迁移。"
     }
