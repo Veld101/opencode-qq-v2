@@ -99,17 +99,84 @@ bun bridge.ts        # 或 cmd /c start-bridge.cmd
 > （中文系统是 GBK）解析，UTF-8 中文字节会导致语法错乱、脚本静默失败——这一坑已实测踩过。
 > 中文只放在快捷方式名字里（`.lnk` 是 UTF-16，不受影响）。
 
+#### 多机器人（多个 AppID 并存，单聊）
+
+同一台机器可以同时跑多个单聊机器人。每个机器人 = **独立 AppID + 独立配置目录**，
+彼此不共享会话、不共享日志、也不会互抢网关锁。
+
+一键新建：
+
+```powershell
+pwsh -File scripts/new-bot.ps1 -Name bot-b -Workdir D:/workspace/proj-b
+```
+
+它会做三件事：
+
+1. 建配置目录 `~/.config/opencode/bots/bot-b/`，按 `opencode-qq.example.json` 生成配置模板；
+2. 在 `assets/bots/bot-b.ico` 生成图标（按机器人名稳定配色，也可用 `-C1`/`-C2` 指定）；
+3. 在桌面创建「QQ机器人-bot-b」快捷方式（指向 `start-bridge.cmd bot-b`）。
+
+之后只需往该配置里填这个机器人的 `AppID`/`AppSecret`，双击快捷方式即可。
+
+隔离边界全部由环境变量 `OPENCODE_QQ_CONFIG_DIR` 决定（`start-bridge.cmd <bot>` 会设置它）：
+
+| 资源 | 路径 |
+| --- | --- |
+| 配置 | `<configDir>/opencode-qq.json` |
+| 网关锁 | `<configDir>/opencode-qq-gateway.lock` |
+| 会话映射 | `<configDir>/opencode-qq-sessions.json` |
+| 实例锁 | `<configDir>/opencode-qq-instance.lock` |
+| 日志 | `<configDir>/opencode-qq.log` |
+
+约定与注意：
+
+- 不带参数的 `start-bridge.cmd` 仍是「默认」实例，读 `~/.config/opencode/opencode-qq.json`，**与旧用法完全兼容**。
+- 不同机器人**必须是不同的 AppID**：同一个 AppID 并发连网关会被平台踢下线。
+- 会话严格隔离：同一个用户分别对两个机器人说话，得到两条互不相干的 OpenCode 会话。
+- 工作目录按机器人各自配置（`workdir` / `workspaces`），可以指向不同项目，互不影响。
+- 停止单个机器人：`pwsh -File scripts/stop.ps1 -Bot bot-b`；不带 `-Bot` 则停止全部桥进程。
+- 不要用 `OPENCODE_QQ_CONFIG` 来做多实例隔离——它只换配置文件，锁 / 会话 / 日志仍会共用。
+- **单实例**：同一个机器人的桥进程只允许一个。重复双击同一个快捷方式时，后启动的进程会打印
+  「已有实例在运行」并自动关闭窗口（退出码 3），不会进入重启循环，也不会重复推送通知。
+  守卫文件是 `<configDir>/opencode-qq-instance.lock`，按机器人隔离，多个机器人互不影响。
+- **快捷方式约定**：桌面 `QQ机器人-<name>` → 目标 `start-bridge.cmd`，参数 `<name>`，
+  图标 `assets/bots/<name>.ico`（同名恒定配色），窗口标题 `QQ Bot [<name>]`，便于多窗口区分。
+
+##### 管理快捷方式（全部启动 / 全部停止）
+
+```powershell
+pwsh -File scripts/install-shortcuts.ps1   # 一次性在桌面创建下面两个快捷方式
+```
+
+| 快捷方式 | 行为 |
+| --- | --- |
+| `QQ机器人-全部启动` | 遍历默认实例与 `bots/*/`，逐个拉起（每个一个窗口；已在运行的会自行跳过） |
+| `QQ机器人-全部停止` | 调 `scripts/stop.ps1` 停掉所有桥进程，并保留窗口显示结果 |
+
+##### 把「默认实例」迁移成具名机器人（可选）
+
+```powershell
+pwsh -File scripts/stop.ps1                             # 先停掉默认实例
+pwsh -File scripts/migrate-default-bot.ps1 -Name main   # 迁移并生成「QQ机器人-main」
+```
+
+迁移会移动 `opencode-qq.json`、`opencode-qq-sessions.json` 与日志到 `bots/main/`，
+再由 `new-bot.ps1` 生成图标与快捷方式；旧的「QQ机器人」快捷方式会被清理。
+**会话文件一并带走，所以历史上下文能延续。**
+
 #### 可选：开机/登录自动启动
 
 如果不想每次手动点（**注意：触发条件是「登录时」，不是「开机时」**）：
 
 ```powershell
-pwsh -File scripts/install-task.ps1     # 注册计划任务（无需管理员）
-pwsh -File scripts/uninstall-task.ps1   # 卸载
+pwsh -File scripts/install-task.ps1             # 默认实例
+pwsh -File scripts/install-task.ps1 -Bot bot-b  # 指定机器人
+pwsh -File scripts/uninstall-task.ps1 -Bot bot-b
 ```
 
-任务 `opencode-qq-bridge` 会在用户登录后延迟 30 秒启动 `scripts/supervisor.ps1`，
-由它拉起并看护 `bun bridge.ts`。
+任务名默认为 `opencode-qq-bridge`，带 `-Bot` 时为 `opencode-qq-bridge-<name>`；
+它会在用户登录后延迟 30 秒启动 `scripts/supervisor.ps1`（带 `-Bot`），
+由它拉起并看护 `bun bridge.ts`。若发现该机器人已有实例在运行，守护会自行退出，不会无限重启。
 
 为什么不做成真正的 Windows 服务：服务默认以 `LocalSystem` 运行，**拿不到你的用户目录**
 （配置 `~/.config/opencode/`、锁、日志都在那），也连不上**按用户注册的 OpenCode 服务**，
@@ -344,13 +411,27 @@ src/
   qq/{auth,gateway,api,stream}.ts   QQ 官方协议实现
   util/{chunk,media,quote,throttle}.ts
 scripts/
-  supervisor.ps1          守护脚本（可选：自动启动时用）
-  install-task.ps1        注册「登录时自启」计划任务（可选）
-  uninstall-task.ps1      卸载计划任务
-  stop.ps1                停止桥进程（窗口丢失时兜底）
+  supervisor.ps1          守护脚本（-Bot 指定机器人；桥崩溃后自动重启）
+  install-task.ps1        注册「登录时自启」计划任务（-Bot）
+  uninstall-task.ps1      卸载计划任务（-Bot）
+  stop.ps1                停止桥进程（-Bot 只停指定机器人；不带则停全部）
+  new-bot.ps1             新建机器人实例（配置目录 + 图标 + 桌面快捷方式）
+  migrate-default-bot.ps1 把默认实例迁移成具名机器人（可选，一次性）
+  install-shortcuts.ps1   创建「全部启动 / 全部停止」桌面快捷方式
+  make-bot-icon.ps1       生成机器人图标（多尺寸 .ico）
+  make-glyph-icon.ps1     生成管理图标（▶ 运行 / ■ 停止）
+  icon-lib.ps1            .ico 生成共享实现（供上面两个图标脚本复用）
   probe-qq.ts             凭据 + 网关 + 收发连通性探针
   selftest.ts             无凭据逻辑自测
+assets/
+  qqbot.ico               默认机器人的图标（桌面快捷方式引用）
+  run-all.ico             管理快捷方式图标「全部启动」
+  stop-all.ico            管理快捷方式图标「全部停止」
+  bots/<name>.ico         各机器人实例图标（由 new-bot.ps1 生成）
 start-bridge.cmd          手动启动入口（桌面快捷方式指向它；保持纯 ASCII）
+                          无参数 = 默认实例；`start-bridge.cmd <bot>` = 多机器人实例
+start-all.cmd             拉起所有机器人（每个一个窗口；保持纯 ASCII）
+stop-all.cmd              停止所有机器人（包装 scripts/stop.ps1；保持纯 ASCII）
 ```
 
 ## License
