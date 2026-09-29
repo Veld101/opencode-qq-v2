@@ -6,7 +6,9 @@
 # 用法:
 #   pwsh -File scripts/new-bot.ps1 -Name bot-a
 #   pwsh -File scripts/new-bot.ps1 -Name bot-b -Workdir D:/workspace/proj-b
-#   pwsh -File scripts/new-bot.ps1 -Name bot-c -C1 '#B07CFF' -C2 '#6A2BD9'
+#   pwsh -File scripts/new-bot.ps1 -Name bot-c -ShortcutDir 'D:\tools\快捷方式'
+#
+# 快捷方式目录优先级：-ShortcutDir > $env:OPENCODE_QQ_SHORTCUT_DIR > 桌面
 #
 # 建完之后需要手动做的一件事：往生成的 opencode-qq.json 里填该机器人的
 # AppID / AppSecret（不同机器人必须是不同的 AppID）。
@@ -15,6 +17,7 @@ param(
     [string]$Workdir,
     [string]$C1,
     [string]$C2,
+    [string]$ShortcutDir,
     [switch]$NoShortcut
 )
 
@@ -23,6 +26,10 @@ $ErrorActionPreference = 'Stop'
 if ($Name -notmatch '^[A-Za-z0-9_-]+$') {
     throw "机器人名只能是字母/数字/下划线/连字符（得到：$Name）"
 }
+
+$shortcutDir = if ($ShortcutDir) { $ShortcutDir }
+               elseif ($env:OPENCODE_QQ_SHORTCUT_DIR) { $env:OPENCODE_QQ_SHORTCUT_DIR }
+               else { [Environment]::GetFolderPath('Desktop') }
 
 $repo   = Split-Path -Parent $PSScriptRoot          # 仓库根目录
 $cfgDir = Join-Path $env:USERPROFILE ".config\opencode\bots\$Name"
@@ -82,8 +89,8 @@ Write-Host "[2/3] 已生成图标: $iconPath  ($C1 -> $C2)"
 if ($NoShortcut) {
     Write-Host '[3/3] 跳过快捷方式（-NoShortcut）'
 } else {
-    $desktop = [Environment]::GetFolderPath('Desktop')
-    $lnkPath = Join-Path $desktop "QQ机器人-$Name.lnk"
+    if (-not (Test-Path -LiteralPath $shortcutDir)) { [void](New-Item -ItemType Directory -Path $shortcutDir -Force) }
+    $lnkPath = Join-Path $shortcutDir "QQ机器人-$Name.lnk"
     $sh = New-Object -ComObject WScript.Shell
     $lnk = $sh.CreateShortcut($lnkPath)
     $lnk.TargetPath       = $launcher
@@ -92,12 +99,12 @@ if ($NoShortcut) {
     $lnk.IconLocation     = "$iconPath,0"
     $lnk.Description      = "opencode-qq 机器人实例：$Name"
     $lnk.Save()
-    Write-Host "[3/3] 已创建桌面快捷方式: $lnkPath"
+    Write-Host "[3/3] 已创建快捷方式: $lnkPath"
 }
 
 Write-Host ''
 Write-Host '下一步：'
 Write-Host "  1) 编辑 $cfgFile，填入该机器人的 AppID / AppSecret"
 if ($Workdir) { Write-Host "     工作目录已设为: $Workdir" } else { Write-Host '     如需独立工作目录，可在配置里加 "workdir" 或 "workspaces"' }
-Write-Host "  2) 双击桌面「QQ机器人-$Name」启动"
+Write-Host "  2) 双击「QQ机器人-$Name」启动"
 Write-Host "  3) 停止: pwsh -File scripts/stop.ps1 -Bot $Name"

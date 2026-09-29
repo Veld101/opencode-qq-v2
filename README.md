@@ -114,7 +114,7 @@ pwsh -File scripts/new-bot.ps1 -Name bot-b -Workdir D:/workspace/proj-b
 
 1. 建配置目录 `~/.config/opencode/bots/bot-b/`，按 `opencode-qq.example.json` 生成配置模板；
 2. 在 `assets/bots/bot-b.ico` 生成图标（按机器人名稳定配色，也可用 `-C1`/`-C2` 指定）；
-3. 在桌面创建「QQ机器人-bot-b」快捷方式（指向 `start-bridge.cmd bot-b`）。
+3. 创建「QQ机器人-bot-b」快捷方式（指向 `start-bridge.cmd bot-b`；目录规则见下方「快捷方式目录」）。
 
 之后只需往该配置里填这个机器人的 `AppID`/`AppSecret`，双击快捷方式即可。
 
@@ -139,13 +139,16 @@ pwsh -File scripts/new-bot.ps1 -Name bot-b -Workdir D:/workspace/proj-b
 - **单实例**：同一个机器人的桥进程只允许一个。重复双击同一个快捷方式时，后启动的进程会打印
   「已有实例在运行」并自动关闭窗口（退出码 3），不会进入重启循环，也不会重复推送通知。
   守卫文件是 `<configDir>/opencode-qq-instance.lock`，按机器人隔离，多个机器人互不影响。
-- **快捷方式约定**：桌面 `QQ机器人-<name>` → 目标 `start-bridge.cmd`，参数 `<name>`，
+- **快捷方式约定**：`QQ机器人-<name>` → 目标 `start-bridge.cmd`，参数 `<name>`，
   图标 `assets/bots/<name>.ico`（同名恒定配色），窗口标题 `QQ Bot [<name>]`，便于多窗口区分。
+- **快捷方式目录**：优先级为 `-ShortcutDir` 参数 > 环境变量 `OPENCODE_QQ_SHORTCUT_DIR` > 桌面。
+  想集中放一处，设一次用户环境变量即可（下例把所有快捷方式放进 `D:\tools\快捷方式`）：
+  `[Environment]::SetEnvironmentVariable('OPENCODE_QQ_SHORTCUT_DIR', 'D:\tools\快捷方式', 'User')`
 
 ##### 管理快捷方式（全部启动 / 全部停止）
 
 ```powershell
-pwsh -File scripts/install-shortcuts.ps1   # 一次性在桌面创建下面两个快捷方式
+pwsh -File scripts/install-shortcuts.ps1   # 一次性创建下面两个快捷方式（目录同「快捷方式目录」规则）
 ```
 
 | 快捷方式 | 行为 |
