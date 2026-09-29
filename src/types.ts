@@ -56,11 +56,27 @@ export type InboundEvent = {
   data: Record<string, any>
 }
 
-/** 宿主桥接接口：session-manager 只依赖这个抽象，不直接碰 ctx */
+/** 宿主桥接接口：session-manager 只依赖这个抽象，不直接碰 ctx / HTTP */
 export interface HostBridge {
   /** directory 缺省时由宿主决定（跟随插件 location） */
   sessionCreate(title: string, directory?: string): Promise<{ id: string }>
   /** 返回助手回复文本 */
   sessionPrompt(sessionId: string, text: string, noReply: boolean, files?: PromptFile[]): Promise<{ text: string }>
   onSessionReset?(sessionId: string): void
+  isInFlight(sessionId: string): boolean
+}
+
+/**
+ * 完整宿主能力：插件宿主与独立进程宿主各自实现。
+ * 上层编排（src/app.ts）只依赖这个接口，因此同一套逻辑可跑在两种形态下。
+ */
+export interface BridgeHost extends HostBridge {
+  /** 应用（或热更新）配置 */
+  configure(opts: { model?: string; workdir?: string }): void
+  /** 代答权限请求。两种宿主字段名不同（插件用 reply、HTTP 用 decision），由实现抹平 */
+  permissionReply(sessionID: string, requestID: string, decision: "once" | "always" | "reject"): Promise<void>
+  /** 订阅 OpenCode 事件流；实现负责断线重订，直到 signal 被 abort */
+  subscribeEvents(sink: (event: InboundEvent) => void, signal: AbortSignal): Promise<void>
+  /** 用于日志的身份描述（插件 location 或 HTTP endpoint） */
+  describe(): string
 }

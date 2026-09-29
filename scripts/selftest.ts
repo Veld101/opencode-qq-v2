@@ -7,7 +7,7 @@
 import { Approver } from "../src/approver"
 import { AssistantTextBuffer } from "../src/text-buffer"
 import { SessionManager } from "../src/session-manager"
-import { V2Bridge } from "../src/bridge"
+import { PluginHost } from "../src/host/plugin-host"
 import { InstanceLock } from "../src/lock"
 import { parseC2CMessage, isHeartbeatStale } from "../src/qq/gateway"
 import { QQApi, __resetSeqCounters } from "../src/qq/api"
@@ -116,7 +116,7 @@ section("AssistantTextBuffer：V2 流式文本")
 }
 
 // ── SessionManager（含 V2 桥接）──────────────────────────────────────────────
-section("V2Bridge：V2 宿主接口换形")
+section("PluginHost：宿主接口换形")
 {
   const calls: string[] = []
   const messages: any[] = []
@@ -158,7 +158,7 @@ section("V2Bridge：V2 宿主接口换形")
     },
   }
 
-  const bridge = new V2Bridge(ctx)
+  const bridge = new PluginHost(ctx)
   bridge.configure({ model: "anthropic/claude-sonnet-4-5", workdir: "D:/workspace/opencode" })
   const created = await bridge.sessionCreate("标题")
   eq("create 返回 id", created.id, "ses_new")
@@ -169,14 +169,14 @@ section("V2Bridge：V2 宿主接口换形")
   })
   eq("固定 workdir 通过 location 传入", createdInput.location, { directory: "D:/workspace/opencode" })
 
-  const bridgeDefault = new V2Bridge(ctx)
+  const bridgeDefault = new PluginHost(ctx)
   bridgeDefault.configure({})
   await bridgeDefault.sessionCreate("标题2")
   eq("未配置时回退到全局默认模型（modelID → id）", createdInput.model, { providerID: "prov", id: "def-model" })
   eq("未配置 workdir 时不传 location", createdInput.location, undefined)
 
   // 热换模型：configure 必须让解析缓存失效
-  const bridgeHot = new V2Bridge(ctx)
+  const bridgeHot = new PluginHost(ctx)
   bridgeHot.configure({ model: "p1/m1" })
   await bridgeHot.sessionCreate("a")
   eq("模型 A 生效", createdInput.model, { providerID: "p1", id: "m1" })
@@ -185,7 +185,7 @@ section("V2Bridge：V2 宿主接口换形")
   eq("热换模型后缓存失效、新模型生效", createdInput.model, { providerID: "p2", id: "m2" })
 
   defaultModel = undefined
-  const bridgeNone = new V2Bridge({ ...ctx, model: { default: async () => undefined } })
+  const bridgeNone = new PluginHost({ ...ctx, model: { default: async () => undefined } })
   bridgeNone.configure({})
   let threw = ""
   try {
@@ -220,6 +220,7 @@ section("SessionManager：指令、派发与工作区隔离")
       sent.push({ text, noReply })
       return { text: noReply ? "" : `回复:${text}` }
     },
+    isInFlight: () => false,
   }
   const tmp = `D:/Data/Temp/opencode/selftest-sessions-${Date.now()}.json`
   const sm = new SessionManager(fake, tmp, undefined as any, () => 0)
@@ -280,6 +281,7 @@ section("工作区：列表解析与切换隔离")
     async sessionPrompt(_id, text, noReply) {
       return { text: noReply ? "" : `回复:${text}` }
     },
+    isInFlight: () => false,
   }
   const tmp = `D:/Data/Temp/opencode/selftest-ws-${Date.now()}.json`
   const sm = new SessionManager(fake, tmp, undefined as any, () => 0)
@@ -339,6 +341,7 @@ section("SessionManager：v1 存储格式迁移")
     async sessionPrompt() {
       return { text: "" }
     },
+    isInFlight: () => false,
   }
   const sm = new SessionManager(fake, p, undefined as any, () => 0)
   sm.setWorkspaces(resolveWorkspaces({ workspaces: [{ name: "solo", path: "D:/solo" }] } as any))

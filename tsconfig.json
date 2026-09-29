@@ -13,5 +13,5 @@
     "resolveJsonModule": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["index.ts", "src/**/*.ts", "scripts/**/*.ts"]
+  "include": ["index.ts", "bridge.ts", "src/**/*.ts", "scripts/**/*.ts"]
 }

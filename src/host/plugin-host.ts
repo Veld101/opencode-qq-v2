@@ -1,48 +1,49 @@
-import { REPLY_TIMEOUT_MS } from "./constants"
-import type { HostBridge, PromptFile } from "./types"
+import { REPLY_TIMEOUT_MS } from "../constants"
+import { log } from "../logger"
+import type { BridgeHost, InboundEvent, PromptFile } from "../types"
 
 /**
- * OpenCode V2 宿主绑定层。
+ * 插件宿主：跑在 OpenCode 插件运行时内，通过 setup(ctx) 拿到的上下文行事。
  *
- * 与 V1 的关键差异（已核对 V2 OpenAPI / 插件文档）：
- *  - V1: client.session.prompt({body:{parts,noReply}}) 直接返回助手消息 parts
- *  - V2: ctx.session.prompt({sessionID,text,files}) 只做「消息投递」，不返回回复；
- *        必须 ctx.session.wait() 后读 ctx.session.context() 取最终文本
- *  - V1: 无对应 → V2 用 ctx.session.synthetic() 注入不触发回复的消息
- *  - V1: client.config.get() 取默认模型 → V2 ctx.model.default() / ctx.session.create({model})
+ * 与 V2 插件 API 的对接要点（已核对 V2 OpenAPI / 插件文档）：
+ *  - ctx.session.prompt 只投递消息，不返回回复 → 需 wait 后读 context
+ *  - ctx.session.synthetic 注入不触发回复的消息
+ *  - ctx.permission.reply 的字段是 `reply`（HTTP 客户端那边叫 `decision`）
+ *  - ctx.event.subscribe 提供公开事件流
  *
  * ctx 用宽松类型（与同机 codebuddy-auth 插件一致），避免耦合插件 API 的具体版本。
+ *
+ * 注意：插件形态的生命周期绑在 OpenCode 的 location 上——
+ * location 被回收时本插件会被卸载，QQ 网关随之停止且无法自愈。
+ * 需要 7×24 常驻请用独立进程形态（src/host/http-host.ts + bridge.ts）。
  */
-export class V2Bridge implements HostBridge {
+export class PluginHost implements BridgeHost {
   onSessionReset?: (sessionId: string) => void
 
   private model?: string
-  /** 固定工作目录：会话创建时通过 location 指定，避免受插件 location 影响 */
   private workdir?: string
   private modelRef: { providerID: string; id: string } | undefined = undefined
-  /** 正被某条 QQ 消息同步等待的会话，用于抑制重复的完成推送 */
   private inFlight = new Set<string>()
 
   constructor(private ctx: any) {}
 
-  /** 应用（或热更新）配置；模型变化时清掉解析缓存 */
   configure(opts: { model?: string; workdir?: string }): void {
     if (opts.model !== this.model) this.modelRef = undefined
     this.model = opts.model
     this.workdir = opts.workdir
   }
 
+  describe(): string {
+    return `host=plugin location=${this.ctx?.location?.directory ?? "?"}`
+  }
+
   isInFlight(sessionId: string): boolean {
     return this.inFlight.has(sessionId)
   }
 
-  /**
-   * 解析要用的模型：显式配置 > OpenCode 全局默认。
-   * 解析失败不缓存，便于配置变更后自动恢复。
-   */
+  /** 显式配置 > OpenCode 全局默认；失败不缓存，便于配置变更后自动恢复 */
   private async resolveModel(): Promise<{ providerID: string; id: string } | null> {
     if (this.modelRef) return this.modelRef
-
     if (this.model) {
       const i = this.model.indexOf("/")
       if (i > 0) {
@@ -50,7 +51,6 @@ export class V2Bridge implements HostBridge {
         return this.modelRef
       }
     }
-
     try {
       const def = await this.ctx?.model?.default?.()
       const providerID = def?.providerID
@@ -76,7 +76,6 @@ export class V2Bridge implements HostBridge {
     const session = await this.ctx.session.create({
       title,
       model,
-      // 固定工作目录（Location.PublicRef = { directory }）
       ...(dir ? { location: { directory: dir } } : {}),
     })
     return { id: String(session.id) }
@@ -89,13 +88,11 @@ export class V2Bridge implements HostBridge {
     files?: PromptFile[],
   ): Promise<{ text: string }> {
     if (noReply) {
-      // 只写入上下文，不触发模型回复
       await this.ctx.session.synthetic({ sessionID: sessionId, text })
       return { text: "" }
     }
 
     const beforeId = await this.lastAssistantId(sessionId)
-
     this.inFlight.add(sessionId)
     try {
       await this.ctx.session.prompt({
@@ -105,10 +102,28 @@ export class V2Bridge implements HostBridge {
           ? { files: files.map((f) => ({ uri: f.dataUrl, ...(f.name ? { name: f.name } : {}) })) }
           : {}),
       })
-
       return { text: await this.waitForReply(sessionId, beforeId) }
     } finally {
       this.inFlight.delete(sessionId)
+    }
+  }
+
+  async permissionReply(sessionID: string, requestID: string, decision: "once" | "always" | "reject"): Promise<void> {
+    await this.ctx.permission.reply({ sessionID, requestID, reply: decision })
+  }
+
+  async subscribeEvents(sink: (event: InboundEvent) => void, signal: AbortSignal): Promise<void> {
+    while (!signal.aborted) {
+      try {
+        for await (const raw of this.ctx.event.subscribe({ signal })) {
+          if (signal.aborted) break
+          sink({ type: String((raw as any)?.type ?? ""), data: (raw as any)?.data ?? {} })
+        }
+      } catch (e) {
+        if (signal.aborted) break
+        log("WARN", `插件事件订阅中断，2s 后重订: ${String(e).slice(0, 160)}`)
+        await new Promise((r) => setTimeout(r, 2000))
+      }
     }
   }
 

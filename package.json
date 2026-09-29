@@ -1,16 +1,21 @@
 {
   "name": "opencode-qq-v2",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "QQ 官方机器人 <-> OpenCode V2 桥接插件（单聊）",
+  "description": "QQ 官方机器人（单聊）与 OpenCode V2 的桥接，支持插件与独立进程两种形态",
   "main": "index.ts",
   "scripts": {
+    "bridge": "bun bridge.ts",
     "typecheck": "tsc --noEmit",
+    "selftest": "bun scripts/selftest.ts",
     "probe": "bun scripts/probe-qq.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "@opencode/client": "^2.0.19"
   }
 }

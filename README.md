@@ -6,7 +6,21 @@
 原 `opencode-qq`（npm v0.1.0）是 **OpenCode V1 插件**，官方明确 *"V1 plugin implementations do not run in V2"*，
 因此本项目把它**移植到 V2 插件 API**，并修掉了原版的若干问题。
 
-## 架构
+## 两种运行形态（**请用独立进程**）
+
+同一套逻辑（`src/app.ts`）跑在两种宿主上，由启动入口选择：
+
+| 形态 | 入口 | 生命周期 | 适用 |
+| --- | --- | --- | --- |
+| **独立进程** ✅ | `bridge.ts` | **不依赖 OpenCode 的 location**，7×24 常驻 | 机器人 |
+| 服务端插件 | `index.ts` | 绑在 location 上，location 被回收即被卸载 | 临时/开发 |
+
+**为什么推荐独立进程**：OpenCode 会**主动回收空闲 location**（日志里 `location services evicted` 每天出现几十次），
+收回时连带卸载该 location 上的插件。实测曾出现插件被卸载后 **9.4 小时无人接管**，机器人一直掉线——
+因为此时进程内已无本插件的任何代码，定时器/锁/自查全部消失，无法自愈。
+独立进程不受此影响，且崩溃后由守护脚本自动拉起。
+
+## 架构（独立进程形态）
 
 ```
 QQ 用户私聊
@@ -15,19 +29,21 @@ QQ 用户私聊
 QQ 官方 WebSocket 网关 (wss://api.bot.qq.com/websocket/，本机主动外连，无需公网 IP)
     │  C2C_MESSAGE_CREATE / permission.asked / session.text.delta / session.idle …
     ▼
-QQGateway（Token 预刷新 · 心跳 · Resume 补发 · 指数退避重连）
+QQGateway（Token 预刷新 · 心跳+ACK 假死检测 · Resume 补发 · 指数退避重连）
     │
     ├── 指令层：/new  /workspace  /status  /help
     ├── 审批层：Approver（编号 → “同意 N / 拒绝 N / 总是 N”）
     ▼
-V2Bridge ──► OpenCode V2 插件上下文 ctx
-    · ctx.session.create()            建会话
-    · ctx.session.prompt()            投递消息
-    · ctx.session.wait()              等待本轮执行完成
-    · ctx.session.context()           取助手最终文本
-    · ctx.session.synthetic()         注入引导语（不触发回复）
-    · ctx.permission.reply()          代为应答审批
-    · ctx.event.subscribe()           订阅事件流（流式 / 完成 / 出错推送）
+BridgeHost（宿主抽象，两种实现）
+    ├── HttpHost  ──► @opencode/client + Service.ensure()   独立进程形态
+    └── PluginHost ─► setup(ctx) 的插件上下文              插件形态
+          · session.create()          建会话（可指定 location）
+          · session.prompt()          投递消息
+          · session.wait()            等待本轮执行完成
+          · session.context()         取助手最终文本
+          · session.synthetic()       注入引导语（不触发回复）
+          · permissionReply()         代为应答审批
+          · subscribeEvents()         订阅事件流（流式 / 完成 / 出错推送）
     │
     ▼
 QQApi.sendC2C（被动回复优先，额度耗尽降级主动消息；Markdown 失败降级纯文本）
@@ -56,18 +72,50 @@ cd D:/workspace/opencode-qq-v2
 bun install
 ```
 
-在 `~/.config/opencode/opencode.json` 的 `plugins` 数组里加入本目录（**注意 V2 的键是 `plugins` 不是 `plugin`**）：
+### 独立进程形态（推荐）
+
+**不要**把它加进 `opencode.json` 的 `plugins` —— 独立进程自己通过 HTTP API 连 OpenCode。
+
+先手工确认能跑：
+
+```bash
+bun bridge.ts
+```
+
+看到 `OpenCode 服务可达` + `网关已连接` 即正常，`Ctrl+C` 退出。
+
+然后注册「登录时自动启动 + 崩溃自动重启」的计划任务（**无需管理员**）：
+
+```powershell
+pwsh -File scripts/install-task.ps1
+```
+
+它会创建计划任务 `opencode-qq-bridge`：登录后延迟 30 秒启动 `scripts/supervisor.ps1`，
+由守护脚本拉起并看护 `bun bridge.ts`，桥进程退出后 5 秒自动重启。
+
+```powershell
+schtasks /Run   /TN opencode-qq-bridge          # 立即启动
+schtasks /Query /TN opencode-qq-bridge /FO LIST # 查看状态
+schtasks /End   /TN opencode-qq-bridge          # 停止
+pwsh -File scripts/uninstall-task.ps1           # 卸载
+```
+
+### 插件形态（备选）
+
+在 `~/.config/opencode/opencode.json` 的 `plugins` 数组里加入本目录
+（**注意 V2 的键是 `plugins` 不是 `plugin`**）：
 
 ```jsonc
 {
-  "plugins": [
-    "./plugins/codebuddy-auth",
-    "D:/workspace/opencode-qq-v2"
-  ]
+  "plugins": ["D:/workspace/opencode-qq-v2"]
 }
 ```
 
 OpenCode 会热加载；`opencode plugin list` 应能看到 `opencode-qq  local  .../index.ts`。
+⚠️ 该形态无法 7×24 常驻（见上文 location 回收），仅建议临时使用。
+
+> 两种形态可以同时存在：它们用同一把文件锁 `opencode-qq-gateway.lock` 互斥，
+> 只有一个会真正持有 QQ 网关，不会重复收消息。
 
 ## 配置
 
@@ -251,6 +299,8 @@ opencode api get /api/model
 ```
 
 
+## 已知限制
+
 - **仅单聊（C2C）**。群聊需机器人提审上线后在管理端配置，个人开发者沙箱无法测群聊。
 - **机器人不能主动开聊**，必须先由用户发消息。被动回复窗口 60 分钟，每条消息最多回 4 条；超窗转为主动消息，受平台频控与额度约束。
 - 新机器人**正式环境默认启用 IP 白名单**，提审上线前需在管理端填本机公网出口 IP；沙箱不受影响。
@@ -260,23 +310,30 @@ opencode api get /api/model
 ## 目录结构
 
 ```
-index.ts                 插件入口（export default { id, setup }）
+bridge.ts                 独立进程入口（7×24 常驻形态，推荐）
+index.ts                  插件入口（export default { id, setup }；备选形态）
 src/
-  bridge.ts              V2 宿主绑定层（prompt/wait/context/synthetic/permission）
-  session-manager.ts     每个 (openid, 工作区) ↔ 独立长期会话，落盘延续（v2 格式，含 v1 迁移）
-  workspaces.ts          工作区列表解析、按名/序号查找、变更指纹
-  text-buffer.ts         累计 session.text.* 流式文本
-  event-pusher.ts        完成 / 出错 / 工具进度推送
-  approver.ts            权限请求编号与应答解析
-  lock.ts                跨实例互斥锁（令牌 + 心跳 + TTL 接管）
-  logger.ts              独立文件日志
-  config.ts              配置加载（环境变量 > 文件）
-  constants.ts           端点、intent、超时、路径
+  app.ts                  应用编排层（与宿主无关，两种形态共用）
+  host/
+    http-host.ts          独立进程宿主：@opencode/client + Service.ensure()
+    plugin-host.ts        插件宿主：setup(ctx) 的插件上下文
+  session-manager.ts      每个 (openid, 工作区) ↔ 独立长期会话，落盘延续（v2 格式，含 v1 迁移）
+  workspaces.ts           工作区列表解析、按名/序号查找、变更指纹
+  text-buffer.ts          累计 session.text.* 流式文本
+  event-pusher.ts         完成 / 出错 / 工具进度推送
+  approver.ts             权限请求编号与应答解析
+  lock.ts                 跨实例互斥锁（令牌 + 心跳 + TTL 接管）
+  logger.ts               独立文件日志
+  config.ts               配置加载（环境变量 > 文件）
+  constants.ts            端点、intent、超时、路径
   qq/{auth,gateway,api,stream}.ts   QQ 官方协议实现
   util/{chunk,media,quote,throttle}.ts
 scripts/
-  probe-qq.ts            凭据 + 网关 + 收发连通性探针
-  selftest.ts            无凭据逻辑自测（60 项断言）
+  supervisor.ps1          守护脚本：桥进程退出后自动重启
+  install-task.ps1        注册「登录时自启」计划任务
+  uninstall-task.ps1      卸载计划任务
+  probe-qq.ts             凭据 + 网关 + 收发连通性探针
+  selftest.ts             无凭据逻辑自测
 ```
 
 ## License
