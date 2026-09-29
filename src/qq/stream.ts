@@ -1,3 +1,5 @@
+import { log } from "../logger"
+
 type StreamOpts = {
   restBase: string
   getToken: () => Promise<string>
@@ -96,13 +98,19 @@ export class StreamSender {
       )
       if (!res.ok) {
         this.failed = true
+        // 早期版本静默置败，导致「明明开了流式却一直走普通回复」无从排查
+        void res
+          .text()
+          .then((body) => log("WARN", `流式发送被拒 HTTP ${res.status}: ${body.slice(0, 200)}`))
+          .catch(() => log("WARN", `流式发送被拒 HTTP ${res.status}`))
         return
       }
       const data = (await res.json()) as { id?: string }
       if (!this.streamMsgId && data.id) this.streamMsgId = data.id
       this.index++
-    } catch {
+    } catch (e) {
       this.failed = true
+      log("WARN", `流式发送异常: ${String(e).slice(0, 200)}`)
     }
   }
 }
