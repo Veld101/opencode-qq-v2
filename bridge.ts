@@ -7,12 +7,36 @@
 //
 // 运行：
 //   bun bridge.ts
+//   bun bridge.ts --bot <name>    多机器人：实例名，仅用于日志标识（配置目录由
+//                                 OPENCODE_QQ_CONFIG_DIR 决定，见 start-bridge.cmd）
 import { startApp } from "./src/app"
 import { HttpHost } from "./src/host/http-host"
+import { InstanceLock } from "./src/lock"
 import { log } from "./src/logger"
 
+/** 重复启动时的退出码；start-bridge.cmd 据此关闭窗口，而不是进入重启循环 */
+const EXIT_ALREADY_RUNNING = 3
+
+/** 读取 `--flag value` 形式的启动参数（缺失返回 undefined） */
+function argValue(name: string): string | undefined {
+  const i = process.argv.indexOf(name)
+  return i >= 0 ? process.argv[i + 1] : undefined
+}
+
 async function main(): Promise<void> {
-  log("INFO", `独立桥进程启动 pid=${process.pid}`)
+  const bot = argValue("--bot")
+  const tag = bot ? `bot=${bot} ` : ""
+
+  // 单实例守卫：同一个配置目录只允许一个桥进程。
+  // 每个机器人有各自的 OPENCODE_QQ_CONFIG_DIR，所以守卫天然按机器人隔离；
+  // 重复双击同一个快捷方式时，后启动的进程在这里直接退出（窗口随退出码关闭）。
+  const guard = new InstanceLock("opencode-qq-instance", 60_000)
+  if (!guard.acquire()) {
+    log("WARN", `${tag}已有实例在运行（${guard.path}），本进程退出`)
+    process.exit(EXIT_ALREADY_RUNNING)
+  }
+
+  log("INFO", `独立桥进程启动 ${tag}pid=${process.pid}`)
   const host = await HttpHost.connect()
   await host.health()
   const stop = await startApp(host)
@@ -25,6 +49,11 @@ async function main(): Promise<void> {
     log("INFO", `收到 ${signal}，正在退出`)
     try {
       stop()
+    } catch {
+      /* ignore */
+    }
+    try {
+      guard.release()
     } catch {
       /* ignore */
     }

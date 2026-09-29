@@ -3,11 +3,15 @@
 # 特点：无需管理员（仅当前用户）、登录后延迟 30 秒启动（等 OpenCode 服务就绪）、
 # 崩溃由 supervisor.ps1 自动重启。
 #
-# 用法： pwsh -File scripts/install-task.ps1
+# 用法：
+#   pwsh -File scripts/install-task.ps1              # 默认实例
+#   pwsh -File scripts/install-task.ps1 -Bot bot-a   # 指定机器人（任务名 opencode-qq-bridge-bot-a）
+param(
+    [string]$Bot
+)
 $ErrorActionPreference = 'Stop'
 
-$taskName = 'opencode-qq-bridge'
-$root = Split-Path -Parent $PSScriptRoot
+$taskName = if ($Bot) { "opencode-qq-bridge-$Bot" } else { 'opencode-qq-bridge' }
 $supervisor = Join-Path $PSScriptRoot 'supervisor.ps1'
 
 if (-not (Test-Path $supervisor)) { throw "找不到 $supervisor" }
@@ -17,15 +21,17 @@ if (-not $pwsh) { $pwsh = (Get-Command powershell -ErrorAction SilentlyContinue)
 if (-not $pwsh) { throw '找不到 pwsh/powershell' }
 
 # schtasks 的 /TR 参数：整条命令行用引号包住，内部引号需转义
-$action = "`"$pwsh`" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$supervisor`""
+$botArg = if ($Bot) { " -Bot `"$Bot`"" } else { '' }
+$action = "`"$pwsh`" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$supervisor`"$botArg"
 
 schtasks /Create /TN $taskName /TR $action /SC ONLOGON /DELAY 0000:30 /F | Out-Null
 
 Write-Host "已注册计划任务: $taskName"
 Write-Host "  触发: 用户登录后延迟 30 秒"
+Write-Host "  机器人: $(if ($Bot) { $Bot } else { '(默认实例)' })"
 Write-Host "  命令: $action"
 Write-Host ""
 Write-Host "手动启动:  schtasks /Run    /TN $taskName"
 Write-Host "查看状态:  schtasks /Query  /TN $taskName /FO LIST"
 Write-Host "停止:      schtasks /End    /TN $taskName"
-Write-Host "卸载:      pwsh -File scripts/uninstall-task.ps1"
+Write-Host "卸载:      pwsh -File scripts/uninstall-task.ps1$(if ($Bot) { " -Bot $Bot" })"
