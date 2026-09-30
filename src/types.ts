@@ -34,7 +34,7 @@ export type QqConfig = {
   appSecret: string
   sandbox: boolean
   allowlist: string[]
-  events: { toolProgress: boolean }
+  events: { toolProgress: boolean; mirrorSessionText: boolean }
   model?: string
   /** QQ 会话的工作目录；固定后 QQ 指令始终作用于此目录，不受插件 location 影响 */
   workdir?: string

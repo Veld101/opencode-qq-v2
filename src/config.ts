@@ -33,7 +33,11 @@ export function loadConfig(path: string = CONFIG_PATH()): QqConfig | null {
     appSecret: String(appSecret),
     sandbox: file.sandbox ?? false,
     allowlist: Array.isArray(file.allowlist) ? file.allowlist.map(String) : [],
-    events: { toolProgress: file.events?.toolProgress ?? false },
+    events: {
+      toolProgress: file.events?.toolProgress ?? false,
+      // 把「非 QQ 触发」的助手正文镜像到 QQ（桌面端干活、手机上看）
+      mirrorSessionText: file.events?.mirrorSessionText ?? false,
+    },
     model: typeof modelRaw === "string" && modelRaw.length > 0 ? modelRaw : undefined,
     workdir: typeof workdirRaw === "string" && workdirRaw.length > 0 ? workdirRaw : undefined,
     workspaces: Array.isArray(file.workspaces)

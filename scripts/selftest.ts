@@ -11,13 +11,25 @@ import { PluginHost } from "../src/host/plugin-host"
 import { InstanceLock } from "../src/lock"
 import { parseC2CMessage, isHeartbeatStale } from "../src/qq/gateway"
 import { QQApi, __resetSeqCounters } from "../src/qq/api"
+import { StreamSender, isRetryableStreamStatus } from "../src/qq/stream"
 import { defaultWorkspaceName, findWorkspace, resolveWorkspaces } from "../src/workspaces"
 import { splitText } from "../src/util/chunk"
 import { Throttler } from "../src/util/throttle"
 import { parseCommand } from "../src/commands"
 import fs from "node:fs"
+import os from "node:os"
 import path from "node:path"
+import { EventPusher } from "../src/event-pusher"
 import type { HostBridge, InboundEvent } from "../src/types"
+
+// 自测经 src/logger 落盘，而日志路径默认与线上桥共用一份
+// （~/.config/opencode/opencode-qq.log）——实测会把测试产生的假告警写进生产日志，
+// 排障时极具误导性（曾把 50015001 的测试响应误读成线上故障）；实例锁文件同理。
+// 故强制重定向到临时目录：自测绝不该碰线上目录，所以用赋值而不是 ??=。
+// 另外要先建出目录——logger 用 appendFileSync，不会自动创建父目录，缺目录会静默丢日志。
+const SELFTEST_CFG_DIR = path.join(os.tmpdir(), "opencode-qq-selftest")
+fs.mkdirSync(SELFTEST_CFG_DIR, { recursive: true })
+process.env.OPENCODE_QQ_CONFIG_DIR = SELFTEST_CFG_DIR
 
 let passed = 0
 let failed = 0
@@ -369,6 +381,9 @@ section("InstanceLock：跨进程互斥")
   // 指定独立目录，避免污染真实配置目录
   const dir = `D:/Data/Temp/opencode/locktest-${Date.now()}`
   fs.mkdirSync(dir, { recursive: true })
+  // 记下外层（文件顶部设的临时目录）并在本段结束后恢复：这里若直接 delete，
+  // 会把顶部的重定向一起抹掉，导致本段之后的所有日志又写回线上日志文件。
+  const prevCfgDir = process.env.OPENCODE_QQ_CONFIG_DIR
   process.env.OPENCODE_QQ_CONFIG_DIR = dir
 
   const a = new InstanceLock("gw", 60_000)
@@ -419,7 +434,8 @@ section("InstanceLock：跨进程互斥")
   eq("持有者是自己进程 → 不抢占", selfPid.acquire(), false)
   fs.unlinkSync(lock4)
 
-  delete process.env.OPENCODE_QQ_CONFIG_DIR
+  if (prevCfgDir === undefined) delete process.env.OPENCODE_QQ_CONFIG_DIR
+  else process.env.OPENCODE_QQ_CONFIG_DIR = prevCfgDir
 }
 
 // ── parseC2CMessage ─────────────────────────────────────────────────────────
@@ -506,6 +522,122 @@ section("网关心跳假死判定（掉线不自知的回归）")
   eq("连续 2 次未 ACK → 判假死", isHeartbeatStale(2, interval, interval), true)
   eq("距上次 ACK 超 3 个周期 → 判假死", isHeartbeatStale(0, interval * 3 + 1, interval), true)
   eq("恰好 3 个周期不判（边界）", isHeartbeatStale(0, interval * 3, interval), false)
+}
+
+// ── StreamSender：瞬时失败重试 ──────────────────────────────────────────────
+section("StreamSender：平台瞬时失败的有界重试（回归：一次 500 丢掉整轮打字机）")
+{
+  const mkRes = (status: number, body: unknown = {}): Response =>
+    ({
+      ok: status >= 200 && status < 300,
+      status,
+      json: async () => body,
+      text: async () => JSON.stringify(body),
+    }) as unknown as Response
+
+  eq("500 可重试", isRetryableStreamStatus(500), true)
+  eq("503 可重试", isRetryableStreamStatus(503), true)
+  eq("429 可重试", isRetryableStreamStatus(429), true)
+  eq("400 不重试", isRetryableStreamStatus(400), false)
+  eq("404 不重试", isRetryableStreamStatus(404), false)
+
+  // 前两次 500（线上实际遇到的 50015001「系统繁忙，请稍后重试」），第三次成功
+  const bodies: any[] = []
+  let n = 0
+  const retried = new StreamSender(
+    {
+      restBase: "http://test",
+      getToken: async () => "token",
+      fetchFn: (async (_url: string, init: any) => {
+        bodies.push(JSON.parse(String(init.body)))
+        n++
+        return n < 3
+          ? mkRes(500, { message: "系统繁忙，请稍后重试", code: 50015001 })
+          : mkRes(200, { id: "sm_1" })
+      }) as unknown as typeof fetch,
+    },
+    { openid: "o", msgId: "m", msgSeq: 2 },
+  )
+  await retried.update("第一片")
+  eq("重试后成功 → 不置败", retried.failed, false)
+  eq("共尝试 3 次", bodies.length, 3)
+  eq("重试期间 index 不前进（避免造重复段）", bodies.map((b) => b.index), [0, 0, 0])
+  eq("首帧带 msg_id", bodies[0].msg_id, "m")
+
+  // 4xx 是确定性错误：立即置败、不浪费被动额度
+  let badCalls = 0
+  const noRetry = new StreamSender(
+    {
+      restBase: "http://test",
+      getToken: async () => "token",
+      fetchFn: (async () => {
+        badCalls++
+        return mkRes(400, { code: 40007 })
+      }) as unknown as typeof fetch,
+    },
+    { openid: "o", msgId: "m", msgSeq: 2 },
+  )
+  await noRetry.update("x")
+  eq("4xx 立即置败", noRetry.failed, true)
+  eq("4xx 只尝试 1 次", badCalls, 1)
+}
+
+// ── EventPusher：正文镜像 ───────────────────────────────────────────────────
+section("EventPusher：会话正文镜像（桌面端干活、手机上看）")
+{
+  const sent: string[] = []
+  const handlers: Array<(e: InboundEvent) => void> = []
+  let inFlight = false
+  let mirror = true
+  const pusher = new EventPusher({
+    isOurSession: () => true,
+    openidOfSession: () => "o1",
+    isTurnInFlight: () => inFlight,
+    send: async (_openid, text) => {
+      sent.push(text)
+    },
+    toolProgress: () => false,
+    mirrorText: () => mirror,
+    lastAssistantText: () => "末尾摘要",
+    subscribe: (h) => handlers.push(h),
+  })
+  const emit = (type: string, data: Record<string, any>): void => {
+    for (const h of [...handlers]) h({ type, data })
+  }
+  const ended = (msgId: string, ordinal: number, text: string): void =>
+    emit("session.text.ended", { sessionID: "s1", assistantMessageID: msgId, ordinal, text })
+
+  ended("m1", 0, "第一段正文")
+  eq("正文镜像带前缀", sent.at(-1), "📄 第一段正文")
+
+  ended("m1", 0, "第一段正文")
+  eq("同一块重放不重复推", sent.length, 1)
+
+  ended("m1", 1, "第二段正文")
+  eq("不同 ordinal 视为新块", sent.length, 2)
+
+  inFlight = true
+  ended("m2", 0, "同步回复的内容")
+  eq("在飞回合（QQ 触发）不镜像", sent.length, 2)
+  inFlight = false
+  ended("m2", 0, "同步回复的内容")
+  eq("在飞块迟到也不重复镜像", sent.length, 2)
+
+  ended("m3", 0, "   ")
+  eq("空文本不推", sent.length, 2)
+
+  mirror = false
+  ended("m4", 0, "关闭镜像后不该推")
+  eq("关闭镜像后正文不推", sent.length, 2)
+  emit("session.idle", { sessionID: "s1" })
+  truthy("关闭镜像后回落「任务完成+摘要」", String(sent.at(-1)).includes("任务完成"))
+
+  mirror = true
+  sent.length = 0
+  emit("session.idle", { sessionID: "s1" })
+  eq("打开镜像后 idle 不再补摘要（避免一轮收两遍）", sent.length, 0)
+
+  pusher.dispose()
 }
 
 // ── 汇总 ────────────────────────────────────────────────────────────────────

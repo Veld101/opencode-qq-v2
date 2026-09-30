@@ -231,6 +231,7 @@ OpenCode 会热加载；`opencode plugin list` 应能看到 `opencode-qq  local 
 | `markdownReply` | `true` | 用 Markdown 发送，失败自动降级纯文本 |
 | `streaming` | `true` | 打字机流式输出（依赖 `session.text.delta`），失败自动回落普通回复 |
 | `events.toolProgress` | `false` | 推送工具执行进度（按会话 60 秒至多一条） |
+| `events.mirrorSessionText` | `false` | 把**非 QQ 触发**的助手正文逐段镜像到 QQ（前缀 `📄 `）：在桌面端驱动同一个会话时，手机也能实时看到生成的内容。QQ 自己触发的回合由同步回复覆盖，不会重复。开启后 `session.idle` 不再补发「任务完成+摘要」，避免同一轮收两遍 |
 
 环境变量（优先级高于文件）：`QQ_BOT_APPID`、`QQ_BOT_APPSECRET`、`QQ_BOT_MODEL`、`OPENCODE_QQ_CONFIG`（自定义文件路径）。
 
@@ -370,6 +371,8 @@ ack「已收到，处理中…」(seq=1) + 最终回答（可能分多片）+ �
 
 - **流式打字机**（`streaming: true`，默认开）：生成中的文本每 1.2 秒以全量快照推给 QQ，
   1~3 秒内就能看到文字开始出现
+- **正文镜像**（`events.mirrorSessionText: true`）：桌面端/其它客户端驱动同一个会话时，
+  每段助手正文一生成完就转发一条到 QQ（前缀 `📄 `），手机上也能实时跟进度
 - 回复日志里的 `首字=… 工具=… 总耗时=…`，用于事后定位慢在哪一侧
 
 ### 模型必须配置

@@ -82,10 +82,17 @@ export async function startApp(host: BridgeHost): Promise<() => void> {
       openidOfSession,
       isTurnInFlight: (sid) => bridge.isInFlight(sid),
       send: async (openid, text) => {
-        if (!api) return
-        for (const part of splitText(text)) await api.sendC2C(openid, part)
+        // 主动推送也走 replyTo：被动窗口内优先被动回复（不耗主动额度），失败会落日志。
+        // 再补一条「已送达」记录：不记内容、只记字数，与「收到消息」同一隐私口径——
+        // 否则推送成功时日志里一片空白，收没收到只能靠肉眼。
+        const delivered = await replyTo(openid, text)
+        log(
+          delivered ? "INFO" : "ERROR",
+          `${delivered ? "推送已送达" : "推送未送达"} openid=${openid} 字数=${text.length}`,
+        )
       },
       toolProgress: () => cfg?.events.toolProgress ?? false,
+      mirrorText: () => cfg?.events.mirrorSessionText ?? false,
       lastAssistantText: (sid) => assistantBuf.text(sid),
       subscribe: (h) => listeners.push(h),
     })
@@ -408,7 +415,8 @@ export async function startApp(host: BridgeHost): Promise<() => void> {
         `配置已应用 env=${next.sandbox ? "sandbox" : "prod"} 工作区=[${wsDesc}] ` +
           `model=${next.model ?? "(全局默认)"} ` +
           `allowlist=${next.allowlist.length === 0 ? "(不限制)" : next.allowlist.join(",")} ` +
-          `streaming=${next.streaming} toolProgress=${next.events.toolProgress} log=${LOG_PATH()}`,
+          `streaming=${next.streaming} toolProgress=${next.events.toolProgress} ` +
+            `mirrorText=${next.events.mirrorSessionText} log=${LOG_PATH()}`,
       )
     }
 

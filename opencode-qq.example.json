@@ -12,6 +12,7 @@
   "markdownReply": true,
   "streaming": true,
   "events": {
-    "toolProgress": false
+    "toolProgress": false,
+    "mirrorSessionText": false
   }
 }
