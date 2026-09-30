@@ -8,31 +8,47 @@
 #
 # 识别方式：start-bridge.cmd 用 `bun bridge.ts --bot <name>` 启动实例，
 # 因此可按命令行里的 --bot 精确区分；不带 --bot 的是「默认」实例。
+#
+# 顺序很重要：start-bridge.cmd 自带 :loop，桥退出后 5 秒会把它重新拉起。
+# 只杀 bun 的话，启动窗口会立刻把桥拉回来（表现为「stop 看起来成功、几秒后又上线」）。
+# 所以必须先杀 cmd 宿主（启动窗口），再杀桥进程。
 param(
     [string]$Bot
 )
 
 $ErrorActionPreference = 'Continue'
 
-# 按命令行精确定位桥进程（只杀跑 bridge.ts 的 bun，不误伤其他 bun）
+$all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+
+# 启动窗口：cmd.exe 宿主 start-bridge.cmd（默认实例不带参数，多实例带 <bot> 参数）
+$launchers = @(
+    $all | Where-Object { $_.Name -eq 'cmd.exe' -and $_.CommandLine -like '*start-bridge.cmd*' }
+)
+# 桥进程：只杀跑 bridge.ts 的 bun，不误伤其他 bun
 $procs = @(
-    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^bun(\.exe)?$' -and $_.CommandLine -like '*bridge.ts*' }
+    $all | Where-Object { $_.Name -match '^bun(\.exe)?$' -and $_.CommandLine -like '*bridge.ts*' }
 )
 
 if ($Bot) {
     $pattern = '--bot\s+' + [regex]::Escape($Bot) + '(\s|$)'
     $procs = @($procs | Where-Object { $_.CommandLine -match $pattern })
+    # 窗口命令行形如: cmd /c ""...\start-bridge.cmd" <bot>"
+    $winPattern = 'start-bridge\.cmd"?\s+' + [regex]::Escape($Bot) + '(\s|"|$)'
+    $launchers = @($launchers | Where-Object { $_.CommandLine -match $winPattern })
 }
 
 $killed = @()
+foreach ($p in $launchers) {
+    Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+    $killed += $p.ProcessId
+}
 foreach ($p in $procs) {
     Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
     $killed += $p.ProcessId
 }
 
 if ($killed.Count -gt 0) {
-    Write-Host ("已停止桥进程: {0}" -f ($killed -join ', '))
+    Write-Host ("已停止启动窗口与桥进程: {0}" -f ($killed -join ', '))
 } else {
     if ($Bot) {
         Write-Host ("未发现运行中的桥进程（bot={0}，可能已经停止）" -f $Bot)
