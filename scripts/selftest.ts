@@ -9,7 +9,8 @@ import { AssistantTextBuffer } from "../src/text-buffer"
 import { SessionManager } from "../src/session-manager"
 import { PluginHost } from "../src/host/plugin-host"
 import { InstanceLock } from "../src/lock"
-import { parseC2CMessage, isHeartbeatStale } from "../src/qq/gateway"
+import { parseC2CMessage, isHeartbeatStale, decideHandshake } from "../src/qq/gateway"
+import { FileSessionStore } from "../src/qq/session-store"
 import { QQApi, __resetSeqCounters } from "../src/qq/api"
 import { StreamSender, isRetryableStreamStatus } from "../src/qq/stream"
 import { defaultWorkspaceName, findWorkspace, resolveWorkspaces } from "../src/workspaces"
@@ -436,6 +437,53 @@ section("InstanceLock：跨进程互斥")
 
   if (prevCfgDir === undefined) delete process.env.OPENCODE_QQ_CONFIG_DIR
   else process.env.OPENCODE_QQ_CONFIG_DIR = prevCfgDir
+}
+
+// ── GatewaySessionStore ─────────────────────────────────────────────────────
+section("GatewaySessionStore：会话持久化（重启后仍能 Resume）")
+{
+  const dir = `D:/Data/Temp/opencode/gwsession-${Date.now()}`
+  fs.mkdirSync(dir, { recursive: true })
+  const file = path.join(dir, "opencode-qq-gateway-session.json")
+  const store = new FileSessionStore(file)
+
+  eq("初始无会话", store.load(), null)
+
+  store.save({ sessionId: "sess-1", lastSeq: 1337, at: 111 })
+  eq("保存后可加载", store.load()?.sessionId, "sess-1")
+  eq("seq 一并保留", store.load()?.lastSeq, 1337)
+
+  store.save({ sessionId: "sess-1", lastSeq: 1338, at: 222 })
+  eq("再次保存覆盖为新 seq", store.load()?.lastSeq, 1338)
+
+  store.clear()
+  eq("clear 后无会话", store.load(), null)
+
+  // 损坏 / 缺字段一律视为「没有可恢复的会话」，绝不能抛异常
+  fs.writeFileSync(file, "{ not json")
+  eq("损坏文件 → null（不致命）", store.load(), null)
+
+  fs.writeFileSync(file, JSON.stringify({ sessionId: "", lastSeq: 5 }))
+  eq("空 sessionId → null", store.load(), null)
+
+  fs.writeFileSync(file, JSON.stringify({ sessionId: "x" }))
+  eq("缺 lastSeq → null", store.load(), null)
+
+  fs.writeFileSync(file, JSON.stringify({ sessionId: "x", lastSeq: 0 }))
+  eq("seq=0 是合法值（不能当缺失）", store.load()?.lastSeq, 0)
+
+  fs.rmSync(dir, { recursive: true, force: true })
+}
+
+// ── 握手决策 ────────────────────────────────────────────────────────────────
+section("gateway：Hello 握手决策（有会话就 Resume，才能补发）")
+{
+  eq("无会话 → identify", decideHandshake(null, null), "identify")
+  eq("有会话 + seq → resume", decideHandshake("sess-1", 1337), "resume")
+  eq("seq=0 → resume（0 有效）", decideHandshake("sess-1", 0), "resume")
+  eq("有会话但无 seq → identify", decideHandshake("sess-1", null), "identify")
+  eq("有 seq 但无会话 → identify", decideHandshake(null, 1337), "identify")
+  eq("空字符串 sessionId → identify", decideHandshake("", 1337), "identify")
 }
 
 // ── parseC2CMessage ─────────────────────────────────────────────────────────

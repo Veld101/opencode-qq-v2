@@ -393,6 +393,11 @@ opencode api get /api/model
 - **机器人不能主动开聊**，必须先由用户发消息。被动回复窗口 60 分钟，每条消息最多回 4 条；超窗转为主动消息，受平台频控与额度约束。
 - 新机器人**正式环境默认启用 IP 白名单**，提审上线前需在管理端填本机公网出口 IP；沙箱不受影响。
 - `session.text.delta` 是 ephemeral 事件，断线期间会丢片（`session.text.ended` 会补全量）。
+- **离线期间的消息收不到**。QQ 单聊消息是 WebSocket 事件推送，平台**不提供拉取历史/离线消息的接口**；
+  唯一的补偿是官方网关的 *Resume*：短暂断开（网络抖动、进程崩溃重启）后重连，网关会补发该 `seq` 之后
+  遗漏的事件。为此本桥把 `session_id` + `last_seq` 落盘到 `<configDir>/opencode-qq-gateway-session.json`，
+  让重启也能接住这段补发（日志会打印「网关会话已恢复」；失败则回落到重建会话）。
+  **关机或长时间离线（会话过期）期间的消息平台侧已不存在，无法恢复** —— 只能靠保持常驻来压缩这个窗口。
 - 会话建在**当前工作区**的目录下。未配置 `workspaces` 时等价于 `workdir`；两者都没有时跟随 OpenCode 当前目录。
 
 ## 目录结构
@@ -414,7 +419,7 @@ src/
   logger.ts               独立文件日志
   config.ts               配置加载（环境变量 > 文件）
   constants.ts            端点、intent、超时、路径
-  qq/{auth,gateway,api,stream}.ts   QQ 官方协议实现
+  qq/{auth,gateway,api,stream,session-store}.ts   QQ 官方协议实现（session-store：会话落盘，供重启后 Resume）
   util/{chunk,media,quote,throttle}.ts
 scripts/
   supervisor.ps1          守护脚本（-Bot 指定机器人；桥崩溃后自动重启）

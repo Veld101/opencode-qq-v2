@@ -9,6 +9,7 @@ import { QQGateway, createGatewayUrlFetcher } from "./qq/gateway"
 import { QQApi, reserveSeq } from "./qq/api"
 import { AuthManager } from "./qq/auth"
 import { StreamSender } from "./qq/stream"
+import { FileSessionStore } from "./qq/session-store"
 import { EventPusher } from "./event-pusher"
 import { AssistantTextBuffer } from "./text-buffer"
 import { SessionManager } from "./session-manager"
@@ -201,12 +202,24 @@ export async function startApp(host: BridgeHost): Promise<() => void> {
     }
 
     // ── 网关（每次用当前配置重建，以支持热更新）──────────────────────────────
+    // 会话落盘：进程重启后优先 Resume，让网关补发断开期间遗漏的事件（见 qq/session-store.ts）
+    const sessionStore = new FileSessionStore()
     const gatewayOpts = () => ({
+      sessionStore,
       getGatewayUrl: createGatewayUrlFetcher(restBase, () => auth!.getToken()),
       getToken: () => auth!.getToken(),
       intents: INTENT_GROUP_AND_C2C,
       // 协议字段漂移排查：记录单聊原始事件（省略 content，避免记录聊天内容）
       onEvent: (type: string, data: Record<string, any>) => {
+        // 会话是「新建」还是「恢复」，直接决定重启期间的离线消息能否补发，值得留痕
+        if (type === "READY") {
+          log("INFO", `网关会话已建立（新会话）session=${String(data.session_id ?? "").slice(0, 8)}`)
+          return
+        }
+        if (type === "RESUMED") {
+          log("INFO", "网关会话已恢复（Resume 成功，断开期间遗漏的事件已补发）")
+          return
+        }
         if (type !== "C2C_MESSAGE_CREATE") return
         const { content: _omit, ...rest } = data
         log("INFO", `原始事件 ${type}（省略 content）: ${JSON.stringify(rest).slice(0, 600)}`)

@@ -1,6 +1,7 @@
 import { GATEWAY_PATH } from "../constants"
 import { extractQuotedText } from "../util/quote"
 import type { QqIncoming } from "../types"
+import type { SessionStore } from "./session-store"
 
 const OP_DISPATCH = 0
 const OP_HEARTBEAT = 1
@@ -10,8 +11,27 @@ const OP_INVALID_SESSION = 9
 const OP_HELLO = 10
 const OP_HEARTBEAT_ACK = 11
 
-/** 这些 close code 表示会话不可 Resume，必须清空 session 重新 Identify */
-const NON_RESUMABLE_CLOSE = new Set([4004, 4006, 4007, 4009, 4010, 4011, 4012, 4013, 4014])
+/**
+ * 这些 close code 表示会话不可 Resume，必须清空 session 重新 Identify。
+ *
+ * 注意：4009（连接过期）**不在**此列 —— 官方错误码表明确标它「是否可以重试 RESUME = 是」，
+ * 并要求「重连并执行 resume 进行重新连接」。此前把它当不可恢复，等于每次会话过期都白丢
+ * 一次补发机会（这正是「重启后收不到消息」的一条根因）。
+ */
+const NON_RESUMABLE_CLOSE = new Set([4004, 4006, 4007, 4010, 4011, 4012, 4013, 4014])
+
+/**
+ * 网关握手决策：有可恢复的会话就 Resume（网关会补发该 seq 之后遗漏的事件），
+ * 否则 Identify 开新会话。抽成纯函数以便自测。
+ */
+export function decideHandshake(
+  sessionId: string | null,
+  lastSeq: number | null,
+): "resume" | "identify" {
+  const hasSession = typeof sessionId === "string" && sessionId.length > 0
+  const hasSeq = typeof lastSeq === "number" && Number.isFinite(lastSeq)
+  return hasSession && hasSeq ? "resume" : "identify"
+}
 
 export type GatewayOpts = {
   getGatewayUrl: () => Promise<string>
@@ -28,6 +48,8 @@ export type GatewayOpts = {
   onClose?: (code: number, reason: string) => void
   maxSeen?: number
   reconnectBaseMs?: number
+  /** 会话落盘（重启后仍能 Resume）；不给就不持久化 */
+  sessionStore?: SessionStore
 }
 
 /**
@@ -85,8 +107,33 @@ export class QQGateway {
   private stopped = false
   private seenIds = new Set<string>()
   private seenOrder: string[] = []
+  /** 会话落盘（可选） */
+  private store?: SessionStore
+  /** 上次落盘时间，用于节流 */
+  private lastSaveAt = 0
 
-  constructor(private opts: GatewayOpts) {}
+  constructor(private opts: GatewayOpts) {
+    this.store = opts.sessionStore
+  }
+
+  /** 把当前会话写盘；force 用于「有副作用的事件」必须精确落盘 */
+  private persistSession(force: boolean): void {
+    if (!this.store) return
+    if (this.sessionId === null || this.lastSeq === null) return
+    const now = Date.now()
+    // 高频事件（流式文本）节流即可：seq 略微落后只会让网关多补发几条，
+    // 而那些事件本身是幂等的（文本缓冲为全量覆盖）。
+    if (!force && now - this.lastSaveAt < 1_000) return
+    this.lastSaveAt = now
+    this.store.save({ sessionId: this.sessionId, lastSeq: this.lastSeq, at: now })
+  }
+
+  /** 放弃当前会话，并清掉落盘，避免下次拿着废会话去 Resume */
+  private clearSession(): void {
+    this.sessionId = null
+    this.lastSeq = null
+    this.store?.clear()
+  }
 
   private isDuplicate(key: string): boolean {
     if (!key) return false
@@ -103,11 +150,19 @@ export class QQGateway {
 
   start(): void {
     this.stopped = false
+    // 载入上次的会话：进程重启后也能先试 Resume，把断开期间遗漏的事件补回来
+    const saved = this.store?.load()
+    if (saved) {
+      this.sessionId = saved.sessionId
+      this.lastSeq = saved.lastSeq
+    }
     this.connect().catch(() => this.scheduleReconnect())
   }
 
   stop(): void {
     this.stopped = true
+    // 主动停止前落一次盘：下次启动还能接着 Resume
+    this.persistSession(true)
     this.cleanup()
   }
 
@@ -137,8 +192,7 @@ export class QQGateway {
     if (this.resumeAttempted) {
       // Resume 也失败了 → 放弃会话，下次走 Identify
       this.resumeAttempted = false
-      this.sessionId = null
-      this.lastSeq = null
+      this.clearSession()
     }
     const base = this.opts.reconnectBaseMs ?? 1000
     const delay = Math.min(base * 2 ** this.reconnectAttempt, 60_000)
@@ -168,9 +222,8 @@ export class QQGateway {
     ws.onclose = (ev: CloseEvent) => {
       this.opts.onClose?.(Number(ev.code ?? 0), String(ev.reason ?? ""))
       if (NON_RESUMABLE_CLOSE.has(ev.code)) {
-        this.sessionId = null
-        this.lastSeq = null
         this.resumeAttempted = false
+        this.clearSession()
       }
       this.opts.disconnected()
       this.scheduleReconnect()
@@ -190,7 +243,7 @@ export class QQGateway {
       case OP_HELLO: {
         const interval = Number(pkt.d?.heartbeat_interval ?? 45000)
         this.startHeartbeat(interval)
-        if (this.sessionId !== null && this.lastSeq !== null) {
+        if (decideHandshake(this.sessionId, this.lastSeq) === "resume") {
           this.resumeAttempted = true
           void this.sendResume().catch(() => this.ws?.close())
         } else {
@@ -205,9 +258,8 @@ export class QQGateway {
         break
       case OP_INVALID_SESSION: {
         // 服务端拒绝 Resume：清空会话后重新 Identify，否则会一直重连失败
-        this.sessionId = null
-        this.lastSeq = null
         this.resumeAttempted = false
+        this.clearSession()
         void this.sendIdentify().catch(() => this.ws?.close())
         break
       }
@@ -216,7 +268,11 @@ export class QQGateway {
         const d = (pkt.d ?? {}) as Record<string, any>
         const key: string = pkt.id ?? String(d.msg_id ?? "")
         if (this.isDuplicate(key)) return
-        this.handleDispatch(String(pkt.t ?? ""), d)
+        const type = String(pkt.t ?? "")
+        this.handleDispatch(type, d)
+        // 处理完再落盘 → 崩溃时宁可让网关重发（至少一次语义），也不要丢消息；
+        // 用户消息有副作用（会触发回复），必须精确落盘
+        this.persistSession(type === "C2C_MESSAGE_CREATE")
         break
       }
       default:
@@ -256,9 +312,8 @@ export class QQGateway {
           `连续 ${this.pendingHeartbeats} 次心跳未 ACK，距上次 ACK ${Math.round(sinceAck / 1000)}s`,
         )
         // 假死意味着服务端侧的会话大概率已失效，放弃 Resume，下一轮重新 Identify
-        this.sessionId = null
-        this.lastSeq = null
         this.resumeAttempted = false
+        this.clearSession()
         this.cleanup()
         this.opts.disconnected()
         this.scheduleReconnect()
@@ -276,12 +331,14 @@ export class QQGateway {
       this.sessionId = String(d.session_id ?? "")
       this.resumeAttempted = false
       this.reconnectAttempt = 0
+      this.persistSession(true)
       this.opts.connected()
       return
     }
     if (t === "RESUMED") {
       this.resumeAttempted = false
       this.reconnectAttempt = 0
+      this.persistSession(true)
       this.opts.connected()
       return
     }
