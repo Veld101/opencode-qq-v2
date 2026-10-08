@@ -4,7 +4,7 @@
  *
  * 用法：bun scripts/selftest.ts
  */
-import { Approver } from "../src/approver"
+import { Approver, isPermissionGone } from "../src/approver"
 import { AssistantTextBuffer } from "../src/text-buffer"
 import { SessionManager } from "../src/session-manager"
 import { PluginHost } from "../src/host/plugin-host"
@@ -98,6 +98,15 @@ section("Approver：远程审批")
   ap3.clearSession("ses_3")
   eq("clearSession 只清目标会话", ap3.countBySession("ses_3"), 0)
   eq("clearSession 不影响他人", ap3.countBySession("ses_4"), 1)
+
+  // 双端抢答：桌面弹窗先应答，QQ 侧再答就会拿到 PermissionNotFoundError
+  truthy(
+    "识别「审批已被其它客户端消费」",
+    isPermissionGone(new Error("PermissionNotFoundError: Permission request not found: per_x")),
+  )
+  truthy("识别纯文本形式", isPermissionGone("Permission request not found: per_x"))
+  eq("其它错误不误判", isPermissionGone(new Error("network down")), false)
+  eq("空值不误判", isPermissionGone(undefined), false)
 }
 
 // ── AssistantTextBuffer（V2 事件形状）────────────────────────────────────────

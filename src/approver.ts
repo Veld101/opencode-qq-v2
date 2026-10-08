@@ -1,5 +1,17 @@
 export type PermissionReply = "once" | "always" | "reject"
 
+/**
+ * 该审批请求是否已被「另一个客户端」消费掉。
+ *
+ * 同一条会话可以同时挂在多个客户端上（桌面 GUI + QQ 桥），OpenCode 会把
+ * permission.asked 推给每个客户端；谁先应答，其余客户端再应答时就会收到
+ * PermissionNotFoundError。这不是故障，只是「来晚了一步」——不该报成处理失败。
+ */
+export function isPermissionGone(error: unknown): boolean {
+  const s = String(error)
+  return s.includes("PermissionNotFoundError") || s.includes("Permission request not found")
+}
+
 type Pending = {
   permissionId: string
   sessionId: string

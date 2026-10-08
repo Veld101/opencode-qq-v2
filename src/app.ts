@@ -3,7 +3,7 @@
 // 启动顺序：读配置 → 用宿主桥接 → 订阅事件 → 抢实例锁 → 启网关 → 节流刷流式
 // 配置热更新：轮询 opencode-qq.json 的 mtime，变化即重新应用。
 import fs from "node:fs"
-import { Approver } from "./approver"
+import { Approver, isPermissionGone } from "./approver"
 import { loadConfig } from "./config"
 import { QQGateway, createGatewayUrlFetcher } from "./qq/gateway"
 import { QQApi, reserveSeq } from "./qq/api"
@@ -267,8 +267,16 @@ export async function startApp(host: BridgeHost): Promise<() => void> {
               await replyTo(msg.openid, `#${parsed.seq} 不存在或已超时。`)
               return
             }
-            await host.permissionReply(item.sessionId, item.permissionId, parsed.reply)
-            await replyTo(msg.openid, `已${parsed.reply === "reject" ? "拒绝" : "批准"} #${parsed.seq}`)
+            try {
+              await host.permissionReply(item.sessionId, item.permissionId, parsed.reply)
+              await replyTo(msg.openid, `已${parsed.reply === "reject" ? "拒绝" : "批准"} #${parsed.seq}`)
+            } catch (e) {
+              // 双端抢答：桌面弹窗先答了，QQ 侧就会「来晚一步」。
+              // 这不是故障，直接说清楚；否则整轮会被外层兜底成「处理失败」，看起来像机器人坏了。
+              if (!isPermissionGone(e)) throw e
+              log("INFO", `权限 #${parsed.seq} 已被其它客户端处理（双端抢答），QQ 侧批准未生效`)
+              await replyTo(msg.openid, `#${parsed.seq} 已在其它客户端（如桌面弹窗）处理，此处无需重复批准。`)
+            }
             return
           }
 
