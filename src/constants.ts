@@ -19,8 +19,29 @@ export const MAX_REPLIES_PER_MSG_ID = 4
 export const APPROVAL_TIMEOUT_MS = 10 * 60 * 1000
 /** 流式打字机节流间隔 */
 export const STREAM_FLUSH_INTERVAL_MS = 1200
-/** 等待 OpenCode 单轮执行完成的上限 */
-export const REPLY_TIMEOUT_MS = 30 * 60 * 1000
+/**
+ * 等待 OpenCode 单轮执行完成的上限。
+ *
+ * 取 10 分钟而非更短，是因为实测正常回合经常跑到 5~6 分钟
+ * （日志: 总耗时 323s / 346s / 358s），余量不足会把正常慢回合误判成超时。
+ * 也不必回到 30 分钟：超时只会在 session.wait 反复报错空转时触发
+ * （正常慢回合会一直阻塞在 wait 上直到出结果），30 分钟只是让用户干等。
+ */
+export const REPLY_TIMEOUT_MS = 10 * 60 * 1000
+
+/**
+ * 等待超时时的提示文案。
+ *
+ * 独立成函数是为了可测：QQ 侧文案不能只靠肉眼保证。
+ * 把「最近一次等待错误」带出来，是因为早期实现把 wait 抛的异常整个吞掉，
+ * 用户只收到一句无信息的超时提示，499/中断这类真实原因因此完全无迹可查。
+ */
+export function replyTimeoutMessage(minutes: number, lastWaitError: string | null): string {
+  const hint = "会话可能卡在需要你在桌面客户端确认的弹窗上（question / 审批）"
+  return lastWaitError
+    ? `(等待 OpenCode 回复超时 ${minutes} 分钟：${hint}；最近一次等待错误：${lastWaitError})`
+    : `(等待 OpenCode 回复超时 ${minutes} 分钟：${hint})`
+}
 
 /**
  * OpenCode 配置目录。

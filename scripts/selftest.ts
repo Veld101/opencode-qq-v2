@@ -17,6 +17,7 @@ import { defaultWorkspaceName, findWorkspace, resolveWorkspaces } from "../src/w
 import { splitText } from "../src/util/chunk"
 import { Throttler } from "../src/util/throttle"
 import { parseCommand } from "../src/commands"
+import { replyTimeoutMessage } from "../src/constants"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -695,6 +696,19 @@ section("EventPusher：会话正文镜像（桌面端干活、手机上看）")
   eq("打开镜像后 idle 不再补摘要（避免一轮收两遍）", sent.length, 0)
 
   pusher.dispose()
+}
+
+// ── 回复超时文案 ────────────────────────────────────────────────────────────
+section("回复超时：必须把真实原因带出来（昨晚 499 中断无迹可查的回归）")
+{
+  const plain = replyTimeoutMessage(10, null)
+  truthy("无错误时也给出可操作提示", plain.includes("弹窗"))
+  eq("无错误时不出现 null", plain.includes("null"), false)
+
+  const withErr = replyTimeoutMessage(10, "InterruptError: All fibers interrupted")
+  truthy("带出真实错误原文", withErr.includes("All fibers interrupted"))
+  truthy("带出分钟数", withErr.includes("10 分钟"))
+  truthy("提示可能卡在弹窗", withErr.includes("question"))
 }
 
 // ── 汇总 ────────────────────────────────────────────────────────────────────

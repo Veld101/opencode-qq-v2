@@ -1,6 +1,6 @@
 import { OpenCode } from "@opencode/client"
 import { Service } from "@opencode/client/service"
-import { REPLY_TIMEOUT_MS } from "../constants"
+import { REPLY_TIMEOUT_MS, replyTimeoutMessage } from "../constants"
 import { log } from "../logger"
 import type { BridgeHost, InboundEvent, PromptFile } from "../types"
 
@@ -170,17 +170,31 @@ export class HttpHost implements BridgeHost {
   private async waitForReply(sessionId: string, beforeId: string | null): Promise<string> {
     const deadline = Date.now() + REPLY_TIMEOUT_MS
     let delay = 300
+    /** 最近一次 wait 失败的原文，以及失败次数（超时提示要带上它，否则无从排查） */
+    let lastWaitError: string | null = null
+    let waitErrors = 0
+
     while (Date.now() < deadline) {
       try {
         await this.client.session.wait({ sessionID: sessionId })
-      } catch {
-        /* 会话可能尚未进入 busy，忽略后由轮询兜底 */
+      } catch (e) {
+        // 不能静默吞掉：正常慢回合会一直阻塞在 wait 上直到出结果，
+        // 只有 wait 反复报错（如 499 / All fibers interrupted）才会走到这里空转。
+        waitErrors++
+        lastWaitError = String(e).slice(0, 200)
       }
       const found = await this.readLastAssistant(sessionId)
       if (found && found.id !== beforeId) return found.text
       await new Promise((r) => setTimeout(r, delay))
       delay = Math.min(Math.round(delay * 1.5), 3_000)
     }
-    return "(等待 OpenCode 回复超时)"
+
+    const minutes = Math.round(REPLY_TIMEOUT_MS / 60_000)
+    log(
+      "WARN",
+      `等待会话回复超时 ${minutes} 分钟 session=${sessionId} wait失败=${waitErrors}次 ` +
+        `最近错误=${lastWaitError ?? "（无）"}`,
+    )
+    return replyTimeoutMessage(minutes, lastWaitError)
   }
 }
