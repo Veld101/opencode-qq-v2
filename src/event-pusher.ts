@@ -9,7 +9,7 @@ const MIRROR_SEEN_CAP = 500
 const MIRROR_PREFIX = "📄 "
 
 /** SessionError.Error 是结构化对象，直接 String() 会得到 [object Object] */
-function summarizeError(error: unknown): string {
+export function summarizeError(error: unknown): string {
   if (error && typeof error === "object") {
     const e = error as Record<string, any>
     const message = e.data && typeof e.data === "object" ? e.data.message : undefined

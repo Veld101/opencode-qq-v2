@@ -3,6 +3,7 @@
   "appSecret": "REPLACE_ME_APPSECRET",
   "sandbox": true,
   "model": "providerID/modelID",
+  "modelFallbacks": ["providerID/modelID"],
   "workspaces": [
     { "name": "proj-a", "path": "D:/workspace/proj-a" },
     { "name": "proj-b", "path": "D:/workspace/proj-b" }

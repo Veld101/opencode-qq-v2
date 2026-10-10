@@ -10,7 +10,8 @@ import { QQApi, reserveSeq } from "./qq/api"
 import { AuthManager } from "./qq/auth"
 import { StreamSender } from "./qq/stream"
 import { FileSessionStore } from "./qq/session-store"
-import { EventPusher } from "./event-pusher"
+import { EventPusher, summarizeError } from "./event-pusher"
+import { classifyProviderFailure, pickFallback } from "./model-fallback"
 import { AssistantTextBuffer } from "./text-buffer"
 import { SessionManager } from "./session-manager"
 import { resolveWorkspaces } from "./workspaces"
@@ -138,6 +139,17 @@ export async function startApp(host: BridgeHost): Promise<() => void> {
       }
     })
 
+    // ── 限额降级：记录「这一轮为什么失败」───────────────────────────────────
+    // EventPusher 在回合在飞时会抑制推送（避免与同步回复重复），所以这里单独记录，
+    // 不受抑制影响。key = sessionID。
+    const lastFailure = new Map<string, string>()
+    listeners.push((e) => {
+      if (e.type !== "session.execution.failed") return
+      const sid = String(e.data?.sessionID ?? "")
+      if (!sid) return
+      lastFailure.set(sid, summarizeError(e.data?.error))
+    })
+
     // 订阅公开事件流（具体宿主负责断线重订，直到 abort）
     const abort = new AbortController()
     void host
@@ -199,6 +211,53 @@ export async function startApp(host: BridgeHost): Promise<() => void> {
         }
       }
       return delivered
+    }
+
+    /**
+     * 限额降级：provider 额度耗尽（HTTP 429 / code 6004）时切到备用模型并重发这一条。
+     * 只在「本轮确实记录了限额失败」时触发；调用方保证每条消息最多降级一次。
+     */
+    async function degradeOnQuota(
+      openid: string,
+      promptText: string,
+      files: PromptFile[],
+      firstAnswer: string,
+    ): Promise<string> {
+      const sid = sessions.getSessionId(openid)
+      if (!sid) return firstAnswer
+      const recorded = lastFailure.get(sid)
+      if (recorded) lastFailure.delete(sid)
+      // 第二信号：超时文案里会带出「最近一次等待错误」（见 constants.replyTimeoutMessage），
+      // 若事件链路没能把限额带上来，这里仍有机会捕获到。
+      const failure = recorded ?? (classifyProviderFailure(firstAnswer) ? firstAnswer : undefined)
+      if (!failure) return firstAnswer
+      if (classifyProviderFailure(failure) !== "rate_limit") return firstAnswer
+
+      const fallbacks = cfg?.modelFallbacks ?? []
+      const next = pickFallback(cfg?.model, fallbacks)
+      if (!next || !host.switchModel) {
+        log(
+          "WARN",
+          `限额失败，但无可用降级目标（modelFallbacks=${fallbacks.length}，宿主支持=${!!host.switchModel}）: ${failure.slice(0, 160)}`,
+        )
+        return firstAnswer
+      }
+
+      log("WARN", `限额失败，切换模型 ${cfg?.model ?? "(全局默认)"} → ${next} 并重发: ${failure.slice(0, 160)}`)
+      try {
+        await host.switchModel(sid, next)
+      } catch (e) {
+        log("ERROR", `切换模型失败: ${String(e).slice(0, 200)}`)
+        await replyTo(openid, `⚠️ 模型限额，但切换到 ${next} 失败：${String(e).slice(0, 120)}`)
+        return firstAnswer
+      }
+      await replyTo(
+        openid,
+        `⚠️ 模型限额（${cfg?.model ?? "默认模型"}），已自动切到 ${next} 并重发本条；本会话后续都用它。`,
+      )
+      const retry = await sessions.dispatch(openid, promptText, files)
+      lastFailure.delete(sid)
+      return retry
     }
 
     // ── 网关（每次用当前配置重建，以支持热更新）──────────────────────────────
@@ -300,9 +359,13 @@ export async function startApp(host: BridgeHost): Promise<() => void> {
           const timing = { t0: Date.now(), firstTextAt: null as number | null, tools: 0 }
           timings.set(msg.openid, timing)
           stream = beginStream(msg.openid)
+          // 清掉上一轮残留的失败记录，避免把旧失败误判成本轮限额
+          const sidBefore = sessions.getSessionId(msg.openid)
+          if (sidBefore) lastFailure.delete(sidBefore)
           let answer: string
           try {
             answer = await sessions.dispatch(msg.openid, promptText, files)
+            answer = await degradeOnQuota(msg.openid, promptText, files, answer)
           } finally {
             timings.delete(msg.openid)
           }
@@ -437,7 +500,8 @@ export async function startApp(host: BridgeHost): Promise<() => void> {
           `model=${next.model ?? "(全局默认)"} ` +
           `allowlist=${next.allowlist.length === 0 ? "(不限制)" : next.allowlist.join(",")} ` +
           `streaming=${next.streaming} toolProgress=${next.events.toolProgress} ` +
-            `mirrorText=${next.events.mirrorSessionText} log=${LOG_PATH()}`,
+            `mirrorText=${next.events.mirrorSessionText} ` +
+            `modelFallbacks=[${next.modelFallbacks.join(", ")}] log=${LOG_PATH()}`,
       )
     }
 

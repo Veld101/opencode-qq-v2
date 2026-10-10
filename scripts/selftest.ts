@@ -18,6 +18,7 @@ import { splitText } from "../src/util/chunk"
 import { Throttler } from "../src/util/throttle"
 import { parseCommand } from "../src/commands"
 import { replyTimeoutMessage } from "../src/constants"
+import { classifyProviderFailure, pickFallback, parseModelRef } from "../src/model-fallback"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -709,6 +710,34 @@ section("回复超时：必须把真实原因带出来（昨晚 499 中断无迹
   truthy("带出真实错误原文", withErr.includes("All fibers interrupted"))
   truthy("带出分钟数", withErr.includes("10 分钟"))
   truthy("提示可能卡在弹窗", withErr.includes("question"))
+}
+
+// ── 限额降级 ────────────────────────────────────────────────────────────────
+section("限额降级：只认限额，且不挑等于当前的模型")
+{
+  // 线上真实原文（2026-10-08 / 10-10 各一次）
+  const real =
+    'AI.Error: Provider request failed with HTTP 429: {"code":6004,"msg":"您的使用量已超出频率限制，' +
+    '将在 2026-10-10 13:13:46 UTC+8 重置，您也可以切换其他模型继续使用。"}'
+  eq("识别线上真实 429 原文", classifyProviderFailure(real), "rate_limit")
+  eq("识别 HTTP 429", classifyProviderFailure("Provider request failed with HTTP 429"), "rate_limit")
+  eq("识别 code 6004", classifyProviderFailure('{"code":6004}'), "rate_limit")
+  eq("识别 rate limit 英文", classifyProviderFailure("AI.Error.RateLimit"), "rate_limit")
+  eq("普通错误不误判", classifyProviderFailure("Provider request failed with HTTP 400"), null)
+  eq("网络错误不误判", classifyProviderFailure("getaddrinfo ENOTFOUND api.bot.qq.com"), null)
+  eq("空值不误判", classifyProviderFailure(undefined), null)
+  eq("含随机数字不误判", classifyProviderFailure("trace_id=429abc not a limit"), null)
+
+  eq("跳过等于当前的模型", pickFallback("opencode-go/deepseek-v4.1-flash", ["opencode-go/deepseek-v4.1-flash", "codebuddy/deepseek-v4.1-flash"]), "codebuddy/deepseek-v4.1-flash")
+  eq("取第一个候选", pickFallback("opencode-go/x", ["codebuddy/deepseek-v4.1-flash"]), "codebuddy/deepseek-v4.1-flash")
+  eq("跳过空项", pickFallback("a/b", ["", "  ", "codebuddy/deepseek-v4.1-flash"]), "codebuddy/deepseek-v4.1-flash")
+  eq("无候选返回 null", pickFallback("a/b", []), null)
+  eq("候选全等于当前则 null", pickFallback("a/b", ["a/b"]), null)
+
+  eq("解析模型引用", parseModelRef("codebuddy/deepseek-v4.1-flash"), { providerID: "codebuddy", id: "deepseek-v4.1-flash" })
+  eq("模型 ID 可含斜杠", parseModelRef("openrouter/anthropic/claude"), { providerID: "openrouter", id: "anthropic/claude" })
+  eq("非法引用返回 null", parseModelRef("no-slash"), null)
+  eq("空 provider 返回 null", parseModelRef("/x"), null)
 }
 
 // ── 汇总 ────────────────────────────────────────────────────────────────────

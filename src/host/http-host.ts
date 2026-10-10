@@ -1,6 +1,7 @@
 import { OpenCode } from "@opencode/client"
 import { Service } from "@opencode/client/service"
 import { REPLY_TIMEOUT_MS, replyTimeoutMessage } from "../constants"
+import { parseModelRef } from "../model-fallback"
 import { log } from "../logger"
 import type { BridgeHost, InboundEvent, PromptFile } from "../types"
 
@@ -126,6 +127,13 @@ export class HttpHost implements BridgeHost {
   async permissionReply(sessionID: string, requestID: string, decision: "once" | "always" | "reject"): Promise<void> {
     // HTTP 客户端字段是 decision（插件 ctx 那边叫 reply）
     await this.client.permission.reply({ sessionID, requestID, decision })
+  }
+
+  /** 切换会话后续回合使用的模型（限额降级用）。已实测：切完后续回合确实走新模型。 */
+  async switchModel(sessionID: string, model: string): Promise<void> {
+    const ref = parseModelRef(model)
+    if (!ref) throw new Error(`非法模型引用（应为 providerID/modelID）: ${model}`)
+    await this.client.session.switchModel({ sessionID, model: ref })
   }
 
   async subscribeEvents(sink: (event: InboundEvent) => void, signal: AbortSignal): Promise<void> {

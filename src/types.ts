@@ -36,6 +36,12 @@ export type QqConfig = {
   allowlist: string[]
   events: { toolProgress: boolean; mirrorSessionText: boolean }
   model?: string
+  /**
+   * 限额时的备用模型（按顺序挑第一个与当前不同的）。
+   * provider 额度耗尽（HTTP 429 / code 6004）时自动切过去并重发，避免整轮停摆。
+   * 空数组 = 不启用降级。
+   */
+  modelFallbacks: string[]
   /** QQ 会话的工作目录；固定后 QQ 指令始终作用于此目录，不受插件 location 影响 */
   workdir?: string
   /** 可切换的工作区白名单；未配置时退化为单一工作区（等价于 workdir） */
@@ -75,6 +81,11 @@ export interface BridgeHost extends HostBridge {
   configure(opts: { model?: string; workdir?: string }): void
   /** 代答权限请求。两种宿主字段名不同（插件用 reply、HTTP 用 decision），由实现抹平 */
   permissionReply(sessionID: string, requestID: string, decision: "once" | "always" | "reject"): Promise<void>
+  /**
+   * 切换会话后续回合使用的模型（限额降级用）。
+   * 可选：插件宿主未实现，此时 app 层会跳过降级而不是报错。
+   */
+  switchModel?(sessionID: string, model: string): Promise<void>
   /** 订阅 OpenCode 事件流；实现负责断线重订，直到 signal 被 abort */
   subscribeEvents(sink: (event: InboundEvent) => void, signal: AbortSignal): Promise<void>
   /** 用于日志的身份描述（插件 location 或 HTTP endpoint） */

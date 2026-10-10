@@ -225,6 +225,7 @@ OpenCode 会热加载；`opencode plugin list` 应能看到 `opencode-qq  local 
 | `sandbox` | `false` | 沙箱环境走 `sandbox.api.sgroup.qq.com`；正式走 `api.bot.qq.com` |
 | `allowlist` | `[]` | 允许的 **openid** 白名单。**空数组 = 不限制，强烈建议填上** |
 | `model` | 无 | 覆盖模型，`providerID/modelID`；不填用 OpenCode 全局默认 |
+| `modelFallbacks` | `[]` | 限额时的备用模型，按顺序挑**第一个与当前不同的**。provider 额度耗尽（HTTP 429 / code 6004）时自动切过去并**重发刚才那条**，避免整轮停摆。空数组 = 不启用 |
 | `workspaces` | 无 | 工作区白名单 `[{ name, path }]`。QQ 侧**只能在这些条目之间切换**，不能指定任意路径 |
 | `defaultWorkspace` | 列表首项 | 默认工作区名；指向不存在的名字时回退首项 |
 | `workdir` | 无 | 旧的单一工作目录；**仅在未配置 `workspaces` 时**作为唯一工作区（向后兼容） |
@@ -364,6 +365,28 @@ ack「已收到，处理中…」(seq=1) + 最终回答（可能分多片）+ �
 > 注意：`msg_seq` 计数器位于 `src/qq/api.ts` 的**模块级**。配置热重载会重建 `QQApi` 实例，
 > 若计数器随实例清零，就会在被动窗口内对同一 `msg_id` 重复分配序号，
 > 触发 `40054005 消息被去重，请检查请求msgseq`。回归用例见 `selftest`。
+
+### 模型限额（HTTP 429 / code 6004）
+
+`opencode-go` 等 provider 有**滚动用量**限额，超了会整轮失败并返回：
+
+```
+Provider request failed with HTTP 429:
+{"code":6004,"msg":"您的使用量已超出频率限制，将在 … 重置，您也可以切换其他模型继续使用。"}
+```
+
+配了 `modelFallbacks` 后，桥会自动降级（OpenCode 自身**没有**这个能力：OpenAPI 里
+`fallback`/`failover` 字样为 0，Models 文档的「兜底」只针对"模型不可用"，与限额无关）：
+
+1. 从 `session.execution.failed` 事件取失败原文判定是否为限额（第二信号：超时文案里带出的等待错误）；
+2. 调 `session.switchModel` 切到候选里第一个不同于当前的模型；
+3. 推一条 QQ 通知并**自动重发**刚才那条消息。
+
+注意：
+
+- 切换是**持久**的（记在会话上），不会自动切回；要切回就 `/new` 重开会话，或改回配置后新建。
+- 限额是**按用量**的：小请求能过、大会话过不去（实测同一时刻 5.6k tokens 的小请求正常返回）。
+- 所以备用模型要选**不同 provider**（同 provider 的另一个模型很可能共享同一份额度）。
 
 ### 长时间任务怎么反馈进度
 

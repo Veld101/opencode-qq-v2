@@ -39,6 +39,9 @@ export function loadConfig(path: string = CONFIG_PATH()): QqConfig | null {
       mirrorSessionText: file.events?.mirrorSessionText ?? false,
     },
     model: typeof modelRaw === "string" && modelRaw.length > 0 ? modelRaw : undefined,
+    modelFallbacks: Array.isArray(file.modelFallbacks)
+      ? file.modelFallbacks.map((m: any) => String(m ?? "").trim()).filter((m: string) => m.length > 0)
+      : [],
     workdir: typeof workdirRaw === "string" && workdirRaw.length > 0 ? workdirRaw : undefined,
     workspaces: Array.isArray(file.workspaces)
       ? file.workspaces
